@@ -1,0 +1,55 @@
+name: qcarchive-snowflake
+channels:
+  - conda-forge
+  - conda-forge/label/libint_dev
+  - defaults
+
+dependencies:
+  - pip
+  - postgresql
+
+  # QCPortal dependencies
+  # NOTE: msgpack-python in conda is msgpack in pypi (due to a rename around v0.5)
+  - numpy
+  - msgpack-python
+  - requests
+  - pyyaml
+  - pydantic
+  - zstandard
+  - qcelemental
+  - tabulate
+  - tqdm
+  - pandas
+  - pyjwt
+  - packaging
+  - typing_extensions
+  - python-dateutil
+  - pytz
+
+  # QCFractalCompute dependencies
+  - parsl
+
+  # QCFractal dependencies
+  - flask
+  - flask-jwt-extended
+  - gunicorn
+  - bcrypt
+  - sqlalchemy>=2.0
+  - alembic
+  - psycopg2
+  - geoip2
+
+  # QCFractal Services
+  - torsiondrive
+
+  # Worker codes below
+  - qcengine
+  - psi4>=1.7
+  - rdkit
+
+  # Testing packages
+  - pytest
+
+  - pip:
+      - "geometric @ git+https://github.com/hjnpark/geomeTRIC"
+      - scipy # for geometric

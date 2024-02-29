@@ -1,0 +1,52 @@
+{% set name = "qcfractal" %}
+{% set version = environ.get('GIT_DESCRIBE_TAG', '').lstrip('v') %}
+
+package:
+  name: {{ name }}
+  version: {{ version }}
+
+source:
+  path: ../../
+
+build:
+  number: 0
+  noarch: python
+  script: {{ PYTHON }} -m pip install --no-deps -vv ./{{ name }}
+
+requirements:
+  host:
+    - python >=3.8
+    - setuptools >=61.0
+    - versioningit
+
+  run:
+    - python >=3.8
+    - flask
+    - flask-jwt-extended
+    - gunicorn
+    - bcrypt
+    - sqlalchemy >=2.0
+    - alembic
+    - psycopg2
+
+    # Optional in pyproject.toml
+    - geoip2
+    - torsiondrive
+    - qcfractalcompute ={{ version }}
+
+test:
+  imports:
+    - qcfractal.snowflake
+  commands:
+    - qcfractal-server --help
+
+about:
+  home: https://github.com/MolSSI/QCFractal/
+  dev_url: https://github.com/MolSSI/QCFractal/
+  doc_url: https://molssi.github.io/QCFractal/
+  doc_source_url: https://github.com/MolSSI/QCFractal/blob/main/docs/source/index.rst
+  license: BSD-3-Clause
+  license_url: https://opensource.org/licenses/BSD-3-Clause
+  license_file: LICENSE
+  license_family: BSD
+  summary: Server for the QCArchive project

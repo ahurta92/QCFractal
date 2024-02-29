@@ -1,0 +1,63 @@
+{
+  "schema_name": "qcschema_molecule",
+  "schema_version": 2,
+  "validated": true,
+  "symbols": [
+    "O",
+    "H",
+    "H",
+    "O",
+    "H",
+    "H"
+  ],
+  "geometry": [
+    9.38861253,
+    0.10450853,
+    0.0,
+    8.66355107,
+    -1.55246611,
+    0.0,
+    11.18622028,
+    -0.18972712,
+    0.0,
+    -9.50864641,
+    0.11386092,
+    0.0,
+    -10.23370787,
+    -1.54311372,
+    0.0,
+    -7.71103866,
+    -0.18037473,
+    0.0
+  ],
+  "name": "H4O2",
+  "molecular_charge": 0.0,
+  "molecular_multiplicity": 1,
+  "fragments": [
+    [
+      0,
+      1,
+      2
+    ],
+    [
+      3,
+      4,
+      5
+    ]
+  ],
+  "fragment_charges": [
+    0.0,
+    0.0
+  ],
+  "fragment_multiplicities": [
+    1,
+    1
+  ],
+  "fix_com": false,
+  "fix_orientation": false,
+  "provenance": {
+    "creator": "QCElemental",
+    "version": "v0.23.0+0.ga5885ee.dirty",
+    "routine": "qcelemental.molparse.from_string"
+  }
+}

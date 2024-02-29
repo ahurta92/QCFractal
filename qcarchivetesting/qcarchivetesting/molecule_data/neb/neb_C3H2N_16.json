@@ -1,0 +1,55 @@
+{
+    "schema_name": "qcschema_molecule",
+    "schema_version": 2,
+    "validated": true,
+    "symbols": [
+        "C",
+        "C",
+        "H",
+        "H",
+        "C",
+        "N"
+    ],
+    "geometry": [
+        [
+            -0.15002272,
+            -1.74026871,
+            -2.3442107
+        ],
+        [
+            -1.07962202,
+            -0.73708538,
+            -0.32688382
+        ],
+        [
+            -2.87246267,
+            -0.91749262,
+            0.63612572
+        ],
+        [
+            1.72268173,
+            -1.40474139,
+            -3.14535271
+        ],
+        [
+            0.51821924,
+            1.71376055,
+            2.02770671
+        ],
+        [
+            1.86120644,
+            3.08582757,
+            3.15261483
+        ]
+    ],
+    "name": "C3H2N",
+    "molecular_charge": 0.0,
+    "molecular_multiplicity": 2,
+    "fix_com": false,
+    "fix_orientation": false,
+    "provenance": {
+        "creator": "QCElemental",
+        "version": "v0.25.0",
+        "routine": "qcelemental.molparse.from_schema"
+    }
+}

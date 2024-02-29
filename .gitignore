@@ -103,3 +103,16 @@ runinfo/
 
 # Mac cruft
 .DS_Store
+
+# Backup files
+*~
+
+.mypy_cache
+qcarchivetesting/qcarchivetesting/MaxMind-DB
+conda-build/builds
+GeoLite2-City.mmdb
+
+# Geometric files
+qce.vdata_first
+qce_optim.xyz
+

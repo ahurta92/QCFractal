@@ -1,0 +1,22 @@
+name: qcarchive-qcportal
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  # NOTE: msgpack-python in conda is msgpack in pypi (due to a rename around v0.5)
+  - numpy
+  - msgpack-python
+  - requests
+  - pyyaml
+  - pydantic
+  - zstandard
+  - qcelemental
+  - tabulate
+  - tqdm
+  - pandas
+  - pyjwt
+  - packaging
+  - typing_extensions
+  - python-dateutil
+  - pytz

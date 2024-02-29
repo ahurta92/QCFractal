@@ -1,0 +1,155 @@
+from __future__ import annotations
+
+import logging
+from typing import Dict, Any, Tuple, Callable
+
+from qcelemental.models import Molecule
+from sqlalchemy import select
+
+from qcfractal.components.internal_jobs.db_models import InternalJobORM
+from qcfractal.components.record_db_models import BaseRecordORM
+from qcfractal.db_socket import SQLAlchemySocket
+from qcfractalcompute.compress import compress_result
+from qcportal.compression import decompress, CompressionEnum
+from qcportal.managers import ManagerName
+from qcportal.record_models import RecordStatusEnum, RecordTask
+
+mname1 = ManagerName(cluster="test_cluster", hostname="a_host", uuid="1234-5678-1234-5678")
+mname2 = ManagerName(cluster="test_cluster", hostname="a_host", uuid="2234-5678-1234-5678")
+
+
+class DummyJobProgress:
+    """
+    Functor for updating progress and cancelling internal jobs
+
+    This is a dummy version used for testing
+    """
+
+    def __init__(self):
+        self._runner_uuid = "1234-5678-9101-1213"
+
+    def update_progress(self, progress: int):
+        pass
+
+    def cancelled(self) -> bool:
+        return False
+
+    def deleted(self) -> bool:
+        return False
+
+
+def run_service(
+    storage_socket: SQLAlchemySocket,
+    manager_name: ManagerName,
+    record_id: int,
+    task_key_generator: Callable,
+    result_data: Dict[str, Any],
+    max_iterations: int = 20,
+) -> Tuple[bool, int]:
+    """
+    Runs a service
+    """
+
+    with storage_socket.session_scope() as session:
+        rec = session.get(BaseRecordORM, record_id)
+        assert rec.status in [RecordStatusEnum.waiting, RecordStatusEnum.running]
+
+        owner_user = rec.owner_user.username if rec.owner_user is not None else None
+        owner_group = rec.owner_group.groupname if rec.owner_group is not None else None
+
+        tag = rec.service.tag
+        priority = rec.service.priority
+        service_id = rec.service.id
+
+    n_records = 0
+    n_iterations = 0
+    finished = False
+
+    while n_iterations < max_iterations:
+        with storage_socket.session_scope() as session:
+            n_services = storage_socket.services.iterate_services(session, DummyJobProgress())
+
+            # iterate_services will handle errors
+            if n_services == 0:
+                finished = True
+                break
+
+            # Kinda hacky...
+            # Run any internal jobs that iterate_services added
+            jobname = f"iterate_service_{service_id}"
+            stmt = select(InternalJobORM).where(InternalJobORM.unique_name == jobname)
+            job_orm = session.execute(stmt).scalar_one_or_none()
+
+            if job_orm is not None:
+                storage_socket.internal_jobs._run_single(
+                    session, job_orm, logging.getLogger("internal_job"), DummyJobProgress()
+                )
+                # The function that iterates a service returns True if it is finished
+                if job_orm.result is True:
+                    rec: BaseRecordORM = session.get(BaseRecordORM, record_id)
+
+                    if rec.status == RecordStatusEnum.error:
+                        print("Error in service dependency")
+                        print(rec.status)
+                        print(rec.compute_history[-1].status)
+                        print(decompress(rec.compute_history[-1].outputs["error"].data, CompressionEnum.zstd))
+
+                    assert rec.status == RecordStatusEnum.complete
+                    assert rec.service is None
+                    finished = True
+                    break
+
+        n_iterations += 1
+
+        with storage_socket.session_scope() as session:
+            rec = session.get(BaseRecordORM, record_id)
+            assert rec.status == RecordStatusEnum.running
+
+        # only do 5 tasks at a time. Tests iteration when stuff is not completed
+        manager_programs = storage_socket.managers.get([manager_name.fullname])[0]["programs"]
+        manager_tasks_d = storage_socket.tasks.claim_tasks(manager_name.fullname, manager_programs, ["*"], limit=5)
+        manager_tasks = [RecordTask(**x) for x in manager_tasks_d]
+
+        # Sometimes a task may be duplicated in the service dependencies.
+        # The C8H6 test has this "feature"
+        ids = set(x.record_id for x in manager_tasks)
+
+        with storage_socket.session_scope() as session:
+            recs = [session.get(BaseRecordORM, i) for i in ids]
+            all_usernames = [x.owner_user.username if x.owner_user is not None else None for x in recs]
+            all_groupnames = [x.owner_group.groupname if x.owner_group is not None else None for x in recs]
+            assert all(x == owner_user for x in all_usernames)
+            assert all(x == owner_group for x in all_groupnames)
+            assert all(x.task.priority == priority for x in recs)
+            assert all(x.task.tag == tag for x in recs)
+
+        manager_ret = {}
+        for t in manager_tasks:
+            # The results dict has keys that are generated by a function
+            # That same function is passed into this function
+            task_key = task_key_generator(t)
+
+            task_result = result_data.get(task_key, None)
+            if task_result is None:
+                raise RuntimeError(f"Cannot find task results! key = {task_key}")
+
+            manager_ret[t.id] = compress_result(task_result.dict())
+
+        rmeta = storage_socket.tasks.update_finished(manager_name.fullname, manager_ret)
+        assert rmeta.n_accepted == len(manager_tasks)
+        n_records += len(manager_ret)
+
+    return finished, n_records
+
+
+def compare_validate_molecule(m1: Molecule, m2: Molecule) -> bool:
+    """
+    Validates, and then compares molecules
+
+    Molecules get validated when added to the server, so if we are comparing
+    molecules, we often need to validate the input as well.
+    """
+
+    m1_v = Molecule(**m1.dict(), validate=True)
+    m2_v = Molecule(**m2.dict(), validate=True)
+    return m1_v == m2_v

@@ -1,0 +1,58 @@
+name: Core Tests
+
+on:
+  push:
+    branches:
+      - main
+      - next
+    paths-ignore:
+      - 'docs/**'
+  pull_request:
+    branches:
+      - main
+      - next
+    paths-ignore:
+      - 'docs/**'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.8", "3.9", "3.10", "3.11"]
+        encoding: ["application/json", "application/msgpack"]
+        
+    steps:
+      - name: Install postgres
+        run: sudo apt update && sudo apt install postgresql postgresql-contrib
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Clone the QCArchive repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Clone MaxMind test db repository
+        uses: actions/checkout@v4
+        with:
+          repository: maxmind/MaxMind-DB
+          path: qcarchivetesting/qcarchivetesting/MaxMind-DB
+
+      - name: Install All QCArchive packages
+        shell: bash -l {0}
+        run: |
+          pip install -e ./qcportal -e ./qcfractalcompute -e ./qcfractal[services,geoip,snowflake] -e ./qcarchivetesting
+          pip install scipy "geometric @ git+https://github.com/hjnpark/geomeTRIC"
+
+      - name: Run tests
+        shell: bash -l {0}
+        run: |
+          pytest --runslow --client-encoding="${{ matrix.encoding }}" \
+                 --log-level=DEBUG \
+                 qcfractal qcportal qcfractalcompute
+
