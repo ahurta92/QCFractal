@@ -4,13 +4,14 @@ import logging
 from copy import deepcopy
 
 from qcarchivetesting import geoip_path, geoip_filename, ip_tests_enabled
-from qcfractal.config import DatabaseConfig, update_nested_dict
+from qcfractal.config import DatabaseConfig
 from qcfractal.db_socket import SQLAlchemySocket
 from qcfractal.postgres_harness import PostgresHarness, create_snowflake_postgres
 from qcfractal.snowflake import FractalSnowflake
 from qcportal import PortalClient, ManagerClient
 from qcportal.auth import UserInfo, GroupInfo
 from qcportal.managers import ManagerName
+from qcportal.utils import update_nested_dict
 from .helpers import test_users, test_groups
 
 _activated_manager_programs = {
@@ -70,7 +71,7 @@ class QCATestingPostgresServer:
 
     def __init__(self, db_path: str):
         self.logger = logging.getLogger(__name__)
-        self.harness = create_snowflake_postgres(db_path)
+        self.harness = create_snowflake_postgres("localhost", db_path)
         self.logger.debug(f"Using database located at {db_path} with uri {self.harness.config.safe_uri}")
 
         # Postgres process is up, but the database is not created
@@ -100,7 +101,6 @@ class QCATestingSnowflake(FractalSnowflake):
         self,
         pg_harness: QCATestingPostgresHarness,
         encoding: str,
-        start_api=True,
         create_users=False,
         enable_security=False,
         allow_unauthenticated_read=False,
@@ -130,7 +130,6 @@ class QCATestingSnowflake(FractalSnowflake):
             "get_dataset_entries": 5,
             "get_molecules": 11,
             "get_managers": 10,
-            "get_server_stats": 10,
             "get_error_logs": 10,
             "get_access_logs": 10,
         }
@@ -143,11 +142,12 @@ class QCATestingSnowflake(FractalSnowflake):
         qcf_config["service_frequency"] = 5
         qcf_config["loglevel"] = "DEBUG"
         qcf_config["heartbeat_frequency"] = 3
+        qcf_config["heartbeat_frequency_jitter"] = 0.0
         qcf_config["heartbeat_max_missed"] = 2
-        qcf_config["statistics_frequency"] = 3
 
         qcf_config["database"] = {"pool_size": 0}
         qcf_config["log_access"] = log_access
+        qcf_config["access_log_keep"] = 1
 
         if ip_tests_enabled:
             qcf_config["geoip2_dir"] = geoip_path
@@ -172,9 +172,7 @@ class QCATestingSnowflake(FractalSnowflake):
         if create_users:
             self.create_users()
 
-        # Start the flask api process if requested
-        if start_api:
-            self.start_api()
+        self.start_api()
 
     def create_users(self):
         # Get a storage socket and add the roles/users/passwords
@@ -192,6 +190,10 @@ class QCATestingSnowflake(FractalSnowflake):
         self._stop_compute()
         self._all_completed = set()
         self._qcf_config = self._original_config.copy(deep=True)
+
+        if self._api_proc is None:
+            self.start_api()
+
         self.pg_harness.recreate_database()
 
     def get_storage_socket(self) -> SQLAlchemySocket:

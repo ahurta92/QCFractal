@@ -10,17 +10,18 @@ from typing import TYPE_CHECKING
 
 import sqlalchemy.orm.attributes
 
+from ...db_socket.helpers import insert_general
+
 try:
     from pydantic.v1 import BaseModel, Extra
 except ImportError:
     from pydantic import BaseModel, Extra
 from sqlalchemy import select, func
-from sqlalchemy.dialects.postgresql import insert, array_agg, aggregate_order_by, DOUBLE_PRECISION, TEXT
-from sqlalchemy.orm import lazyload, joinedload, defer, undefer
+from sqlalchemy.dialects.postgresql import array_agg, aggregate_order_by
+from sqlalchemy.orm import lazyload, selectinload, joinedload, defer, undefer
 
 from qcfractal.components.optimization.record_db_models import (
     OptimizationSpecificationORM,
-    OptimizationRecordORM,
 )
 from qcfractal.components.services.db_models import ServiceQueueORM, ServiceDependencyORM
 from qcfractal.components.singlepoint.record_db_models import QCSpecificationORM
@@ -34,7 +35,7 @@ from qcportal.torsiondrive import (
     TorsiondriveSpecification,
     TorsiondriveQueryFilters,
 )
-from qcportal.utils import hash_dict
+from qcportal.utils import hash_dict, is_included
 from .record_db_models import (
     TorsiondriveSpecificationORM,
     TorsiondriveInitialMoleculeORM,
@@ -82,6 +83,7 @@ class TorsiondriveServiceState(BaseModel):
 
 # Meaningless, but unique to torsiondrives
 torsiondrive_insert_lock_id = 14200
+torsiondrive_spec_insert_lock_id = 14201
 
 
 class TorsiondriveRecordSocket(BaseRecordSocket):
@@ -327,6 +329,78 @@ class TorsiondriveRecordSocket(BaseRecordSocket):
                 service_orm.dependencies.append(svc_dep)
                 td_orm.optimizations.append(opt_history)
 
+    def add_specifications(
+        self, td_specs: Sequence[TorsiondriveSpecification], *, session: Optional[Session] = None
+    ) -> Tuple[InsertMetadata, List[int]]:
+        """
+        Adds specifications for torsiondrive services to the database, returning their IDs.
+
+        If an identical specification exists, then no insertion takes place and the id of the existing
+        specification is returned.
+
+        Specification IDs are returned in the same order as the input specifications
+
+        Parameters
+        ----------
+        td_specs
+            Sequence of specifications to add to the database
+        session
+            An existing SQLAlchemy session to use. If None, one will be created. If an existing session
+            is used, it will be flushed (but not committed) before returning from this function.
+
+        Returns
+        -------
+        :
+            Metadata about the insertion, and the IDs of the specifications.
+        """
+
+        to_add = []
+
+        for td_spec in td_specs:
+            td_kw_dict = td_spec.keywords.dict()
+
+            td_spec_dict = {"program": td_spec.program, "keywords": td_kw_dict, "protocols": {}}
+            td_spec_hash = hash_dict(td_spec_dict)
+
+            td_spec_orm = TorsiondriveSpecificationORM(
+                program=td_spec.program,
+                keywords=td_kw_dict,
+                protocols=td_spec_dict["protocols"],
+                specification_hash=td_spec_hash,
+            )
+
+            to_add.append(td_spec_orm)
+
+        with self.root_socket.optional_session(session, False) as session:
+
+            opt_specs = [x.optimization_specification for x in td_specs]
+            meta, opt_spec_ids = self.root_socket.records.optimization.add_specifications(opt_specs, session=session)
+
+            if not meta.success:
+                return (
+                    InsertMetadata(
+                        error_description="Unable to add optimization specifications: " + meta.error_string,
+                    ),
+                    [],
+                )
+
+            assert len(opt_spec_ids) == len(td_specs)
+            for td_spec_orm, opt_spec_id in zip(to_add, opt_spec_ids):
+                td_spec_orm.optimization_specification_id = opt_spec_id
+
+            meta, ids = insert_general(
+                session,
+                to_add,
+                (
+                    TorsiondriveSpecificationORM.specification_hash,
+                    TorsiondriveSpecificationORM.optimization_specification_id,
+                ),
+                (TorsiondriveSpecificationORM.id,),
+                torsiondrive_spec_insert_lock_id,
+            )
+
+            return meta, [x[0] for x in ids]
+
     def add_specification(
         self, td_spec: TorsiondriveSpecification, *, session: Optional[Session] = None
     ) -> Tuple[InsertMetadata, Optional[int]]:
@@ -350,47 +424,50 @@ class TorsiondriveRecordSocket(BaseRecordSocket):
             Metadata about the insertion, and the id of the specification.
         """
 
-        td_kw_dict = td_spec.keywords.dict()
-        kw_hash = hash_dict(td_kw_dict)
+        meta, ids = self.add_specifications([td_spec], session=session)
 
-        with self.root_socket.optional_session(session, False) as session:
-            # Add the optimization specification
-            meta, opt_spec_id = self.root_socket.records.optimization.add_specification(
-                td_spec.optimization_specification, session=session
+        if not ids:
+            return meta, None
+
+        return meta, ids[0]
+
+    def get(
+        self,
+        record_ids: Sequence[int],
+        include: Optional[Sequence[str]] = None,
+        exclude: Optional[Sequence[str]] = None,
+        missing_ok: bool = False,
+        *,
+        session: Optional[Session] = None,
+    ) -> List[Optional[Dict[str, Any]]]:
+        options = []
+        if include:
+            # Initial molecules will get both the ids and the actual molecule
+            if is_included("initial_molecules", include, exclude, False):
+                options.append(
+                    selectinload(TorsiondriveRecordORM.initial_molecules).joinedload(
+                        TorsiondriveInitialMoleculeORM.molecule
+                    )
+                )
+            elif is_included("initial_molecules_ids", include, exclude, False):
+                options.append(selectinload(TorsiondriveRecordORM.initial_molecules))
+
+            if is_included("optimizations", include, exclude, False):
+                options.append(selectinload(TorsiondriveRecordORM.optimizations))
+
+            if is_included("minimum_optimizations", include, exclude, False):
+                options.append(undefer(TorsiondriveRecordORM.minimum_optimizations))
+
+        with self.root_socket.optional_session(session, True) as session:
+            return self.root_socket.records.get_base(
+                orm_type=self.record_orm,
+                record_ids=record_ids,
+                include=include,
+                exclude=exclude,
+                missing_ok=missing_ok,
+                additional_options=options,
+                session=session,
             )
-            if not meta.success:
-                return (
-                    InsertMetadata(
-                        error_description="Unable to add optimization specification: " + meta.error_string,
-                    ),
-                    None,
-                )
-
-            stmt = (
-                insert(TorsiondriveSpecificationORM)
-                .values(
-                    program=td_spec.program,
-                    keywords=td_kw_dict,
-                    keywords_hash=kw_hash,
-                    optimization_specification_id=opt_spec_id,
-                )
-                .on_conflict_do_nothing()
-                .returning(TorsiondriveSpecificationORM.id)
-            )
-
-            r = session.execute(stmt).scalar_one_or_none()
-            if r is not None:
-                return InsertMetadata(inserted_idx=[0]), r
-            else:
-                # Specification was already existing
-                stmt = select(TorsiondriveSpecificationORM.id).filter_by(
-                    program=td_spec.program,
-                    keywords_hash=kw_hash,
-                    optimization_specification_id=opt_spec_id,
-                )
-
-                r = session.execute(stmt).scalar_one()
-                return InsertMetadata(existing_idx=[0]), r
 
     def query(
         self,
@@ -398,23 +475,6 @@ class TorsiondriveRecordSocket(BaseRecordSocket):
         *,
         session: Optional[Session] = None,
     ) -> List[int]:
-        """
-        Query torsiondrive records
-
-        Parameters
-        ----------
-        query_data
-            Fields/filters to query for
-        session
-            An existing SQLAlchemy session to use. If None, one will be created. If an existing session
-            is used, it will be flushed (but not committed) before returning from this function.
-
-        Returns
-        -------
-        :
-            A list of record ids that were found in the database.
-        """
-
         and_query = []
         need_spspec_join = False
         need_optspec_join = False
@@ -785,35 +845,8 @@ class TorsiondriveRecordSocket(BaseRecordSocket):
             optimization in the torsiondrive (representing the angles)
         """
 
-        # Kind of complicated, but this is relatively cross platform
-        # (with postgres, could do a DISTINCT ON)
-
-        # CTE with columns torsiondrive_id, key, min_energy
-        energy_cte = (
-            select(
-                TorsiondriveOptimizationORM.torsiondrive_id.label("torsiondrive_id"),
-                TorsiondriveOptimizationORM.key.label("key"),
-                func.min(OptimizationRecordORM.energies[-1].cast(TEXT).cast(DOUBLE_PRECISION)).label("min_energy"),
-            )
-            .join(OptimizationRecordORM)
-            .group_by("torsiondrive_id", "key")
-        ).cte()
-
-        # Select rows with matching minimum energies
-        # We order by the optimization id desc to handle the case where multiple records with same final energy
-        # Then, the dictionary comprehension at the end last of that energy (lowest id)
-        stmt = (
-            select(TorsiondriveOptimizationORM.key, TorsiondriveOptimizationORM.optimization_id)
-            .join(energy_cte, energy_cte.c.torsiondrive_id == TorsiondriveOptimizationORM.torsiondrive_id)
-            .join(TorsiondriveOptimizationORM.optimization_record)
-            .where(TorsiondriveOptimizationORM.torsiondrive_id == record_id)
-            .where(TorsiondriveOptimizationORM.key == energy_cte.c.key)
-            .where(OptimizationRecordORM.energies[-1].cast(TEXT).cast(DOUBLE_PRECISION) == energy_cte.c.min_energy)
-            .order_by(OptimizationRecordORM.id.desc())
-        )
+        stmt = select(TorsiondriveRecordORM.minimum_optimizations).where(TorsiondriveRecordORM.id == record_id)
 
         with self.root_socket.optional_session(session, True) as session:
-            r = session.execute(stmt).all()  # List of (key, id)
-
-            # If multiple records with the same energy are returned, then this will choose the last
-            return {x: y for x, y in r}
+            r = session.execute(stmt).scalar_one_or_none()  # List of (key, id)
+            return {} if r is None else r

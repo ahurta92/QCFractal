@@ -73,7 +73,7 @@ def get_record_waiting_reason_v1(record_id: int):
 @wrap_route("READ")
 def get_records_v1(record_id: int, url_params: ProjURLParameters, record_type: Optional[str] = None):
     record_socket = storage_socket.records.get_socket(record_type)
-    return record_socket.get([record_id], url_params.include, url_params.exclude)
+    return record_socket.get([record_id], url_params.include, url_params.exclude)[0]
 
 
 @api_v1.route("/records/<string:record_type>/bulkGet", methods=["POST"])
@@ -204,3 +204,10 @@ def get_record_native_file_data_v1(record_id: int, name: str, record_type: Optio
 def get_record_children_status_v1(record_id: int, record_type: Optional[str] = None):
     record_socket = storage_socket.records.get_socket(record_type)
     return record_socket.get_children_status(record_id)
+
+
+@api_v1.route("/records/<string:record_type>/<int:record_id>/children_errors", methods=["GET"])
+@wrap_route("READ")
+def get_record_children_errors_v1(record_id: int, record_type: Optional[str] = None):
+    record_socket = storage_socket.records.get_socket(record_type)
+    return record_socket.get_children_errors(record_id)

@@ -20,7 +20,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.8", "3.9", "3.10", "3.11"]
+        python-version: ["3.9", "3.10", "3.11"]
         encoding: ["application/json", "application/msgpack"]
         
     steps:
@@ -28,7 +28,7 @@ jobs:
         run: sudo apt update && sudo apt install postgresql postgresql-contrib
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -47,7 +47,6 @@ jobs:
         shell: bash -l {0}
         run: |
           pip install -e ./qcportal -e ./qcfractalcompute -e ./qcfractal[services,geoip,snowflake] -e ./qcarchivetesting
-          pip install scipy "geometric @ git+https://github.com/hjnpark/geomeTRIC"
 
       - name: Run tests
         shell: bash -l {0}

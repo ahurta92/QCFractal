@@ -10,7 +10,7 @@ except ImportError:
     from pydantic import BaseModel, Field, validator
 from typing_extensions import Literal
 
-from qcportal.utils import seconds_to_hms
+from qcportal.utils import seconds_to_hms, duration_to_seconds, update_nested_dict
 
 
 def _make_abs_path(path: Optional[str], base_folder: str, default_filename: Optional[str]) -> Optional[str]:
@@ -29,15 +29,6 @@ def _make_abs_path(path: Optional[str], base_folder: str, default_filename: Opti
     else:
         path = os.path.join(base_folder, path)
         return os.path.abspath(path)
-
-
-def update_nested_dict(d, u):
-    for k, v in u.items():
-        if isinstance(v, dict):
-            d[k] = update_nested_dict(d.get(k, {}), v)
-        else:
-            d[k] = v
-    return d
 
 
 class PackageEnvironmentSettings(BaseModel):
@@ -120,10 +111,7 @@ class TorqueExecutorConfig(ExecutorConfig):
 
     @validator("walltime", pre=True)
     def walltime_must_be_str(cls, v):
-        if isinstance(v, int):
-            return seconds_to_hms(v)
-        else:
-            return v
+        return seconds_to_hms(duration_to_seconds(v))
 
 
 class LSFExecutorConfig(ExecutorConfig):
@@ -143,10 +131,7 @@ class LSFExecutorConfig(ExecutorConfig):
 
     @validator("walltime", pre=True)
     def walltime_must_be_str(cls, v):
-        if isinstance(v, int):
-            return seconds_to_hms(v)
-        else:
-            return v
+        return seconds_to_hms(duration_to_seconds(v))
 
 
 AllExecutorTypes = Union[
@@ -206,8 +191,23 @@ class FractalComputeConfig(BaseModel):
         "itself down to maintain integrity between it and the Fractal Server. Units of seconds",
         gt=0,
     )
+    update_frequency_jitter: float = Field(
+        0.1,
+        description="The update frequency will be modified by up to a certain amount for each request. The "
+        "update_frequency_jitter represents a fraction of the update_frequency to allow as a max. "
+        "Ie, update_frequency=60, and jitter=0.1, updates will happen between 54 and 66 seconds. "
+        "This helps with spreading out server load.",
+        ge=0,
+    )
+
+    max_idle_time: Optional[int] = Field(
+        None,
+        description="Maximum consecutive time in seconds that the manager "
+        "should be allowed to run. If this is reached, the manager will shutdown.",
+    )
 
     parsl_run_dir: str = "parsl_run_dir"
+    parsl_usage_tracking: int = 0
 
     server: FractalServerSettings = Field(...)
     environments: PackageEnvironmentSettings = PackageEnvironmentSettings()
@@ -224,6 +224,10 @@ class FractalComputeConfig(BaseModel):
     @validator("parsl_run_dir")
     def _check_run_dir(cls, v, values):
         return _make_abs_path(v, values["base_folder"], "parsl_run_dir")
+
+    @validator("update_frequency", "max_idle_time", pre=True)
+    def _convert_durations(cls, v):
+        return duration_to_seconds(v)
 
 
 def read_configuration(file_paths: List[str], extra_config: Optional[Dict[str, Any]] = None) -> FractalComputeConfig:

@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import pytest
+
 import qcportal.dataset_testing_helpers as ds_helpers
+from qcportal.dataset_testing_helpers import dataset_submit_test_client
 from qcportal.gridoptimization import (
     GridoptimizationDatasetNewEntry,
     GridoptimizationSpecification,
@@ -126,6 +129,11 @@ def test_gridoptimization_dataset_model_rename_entry(snowflake_client: PortalCli
     ds_helpers.run_dataset_model_rename_entry(snowflake_client, ds, test_entries, test_specs)
 
 
+def test_gridoptimization_dataset_model_modify_entries(snowflake_client: PortalClient):
+    ds = snowflake_client.add_dataset("gridoptimization", "Test dataset")
+    ds_helpers.run_dataset_model_modify_entries(snowflake_client, ds, test_entries, test_specs)
+
+
 def test_gridoptimization_dataset_model_delete_entry(snowflake_client: PortalClient):
     ds = snowflake_client.add_dataset("gridoptimization", "Test dataset")
     ds_helpers.run_dataset_model_delete_entry(snowflake_client, ds, test_entries, test_specs)
@@ -156,11 +164,16 @@ def test_gridoptimization_dataset_model_remove_record(snowflake_client: PortalCl
     ds_helpers.run_dataset_model_remove_record(snowflake_client, ds, test_entries, test_specs)
 
 
-def test_gridoptimization_dataset_model_submit(snowflake_client: PortalClient):
-    ds = snowflake_client.add_dataset(
-        "gridoptimization", "Test dataset", default_tag="default_tag", default_priority=PriorityEnum.low
+@pytest.mark.parametrize("background", [True, False])
+def test_gridoptimization_dataset_model_submit(dataset_submit_test_client: PortalClient, background):
+    ds = dataset_submit_test_client.add_dataset(
+        "gridoptimization",
+        "Test dataset",
+        default_tag="default_tag",
+        default_priority=PriorityEnum.low,
+        owner_group="group1",
     )
-    ds_helpers.run_dataset_model_submit(ds, test_entries, test_specs[0], record_compare)
+    ds_helpers.run_dataset_model_submit(ds, test_entries, test_specs[0], record_compare, background)
 
 
 def test_gridoptimization_dataset_model_submit_missing(snowflake_client: PortalClient):

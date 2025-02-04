@@ -5,18 +5,16 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
 from sqlalchemy import and_, update, select
-from sqlalchemy.orm import selectinload, defer, undefer, lazyload, joinedload
 
 from qcfractal.db_socket.helpers import get_query_proj_options, get_count, get_general
-from qcportal.exceptions import MissingDataError, ComputeManagerError
+from qcportal.exceptions import ComputeManagerError
 from qcportal.managers import ManagerStatusEnum, ManagerName, ManagerQueryFilters
 from qcportal.utils import now_at_utc
-from .db_models import ComputeManagerLogORM, ComputeManagerORM
+from .db_models import ComputeManagerORM
 
 if TYPE_CHECKING:
     from sqlalchemy.orm.session import Session
     from qcfractal.db_socket.socket import SQLAlchemySocket
-    from qcfractal.components.internal_jobs.status import JobProgress
     from typing import List, Iterable, Optional, Sequence, Sequence, Dict, Any
 
 
@@ -30,55 +28,20 @@ class ManagerSocket:
         self._logger = logging.getLogger(__name__)
 
         self._manager_heartbeat_frequency = root_socket.qcf_config.heartbeat_frequency
+        self._manager_heartbeat_frequency_jitter = root_socket.qcf_config.heartbeat_frequency_jitter
         self._manager_max_missed_heartbeats = root_socket.qcf_config.heartbeat_max_missed
 
-        # Add the initial job for checking on managers
-        self.add_internal_job_check_heartbeats(0.0)
-
-    def add_internal_job_check_heartbeats(self, delay: float, *, session: Optional[Session] = None):
-        """
-        Adds an internal job to check for dead managers
-
-        Parameters
-        ----------
-        delay
-            Schedule for this many seconds in the future
-        session
-            An existing SQLAlchemy session to use. If None, one will be created. If an existing session
-            is used, it will be flushed (but not committed) before returning from this function.
-        """
-        with self.root_socket.optional_session(session) as session:
+        with self.root_socket.session_scope() as session:
             self.root_socket.internal_jobs.add(
                 "check_manager_heartbeats",
-                now_at_utc() + timedelta(seconds=delay),
+                now_at_utc(),
                 "managers.check_manager_heartbeats",
                 {},
                 user_id=None,
                 unique_name=True,
-                after_function="managers.add_internal_job_check_heartbeats",
-                after_function_kwargs={"delay": self._manager_heartbeat_frequency},
+                repeat_delay=self._manager_heartbeat_frequency,
                 session=session,
             )
-
-    @staticmethod
-    def save_snapshot(orm: ComputeManagerORM):
-        """
-        Saves the statistics of a manager to its log entries
-        """
-
-        log_orm = ComputeManagerLogORM(
-            claimed=orm.claimed,
-            successes=orm.successes,
-            failures=orm.failures,
-            rejected=orm.rejected,
-            active_tasks=orm.active_tasks,
-            active_cores=orm.active_cores,
-            active_memory=orm.active_memory,
-            total_cpu_hours=orm.total_cpu_hours,
-            timestamp=orm.modified_on,
-        )
-
-        orm.log.append(log_orm)
 
     def activate(
         self,
@@ -96,7 +59,9 @@ class ManagerSocket:
 
         # Strip out empty tags and programs
         tags = [x.lower() for x in tags if len(x) > 0]
-        programs = {k.lower(): v for k, v in programs.items() if len(k) > 0}
+
+        # Some version strings can contain uppercase characters
+        programs = {k.lower(): [v.lower() for v in vlst] for k, vlst in programs.items() if len(k) > 0}
 
         if len(tags) == 0:
             raise ComputeManagerError("Manager does not have any tags assigned. Use '*' to match all tags")
@@ -139,16 +104,11 @@ class ManagerSocket:
         session: Optional[Session] = None,
     ):
         """
-        Updates the resources available/in use by a manager, and saves it to its log entries
+        Updates the resources available/in use by a manager
         """
 
         with self.root_socket.optional_session(session) as session:
-            stmt = (
-                select(ComputeManagerORM)
-                .options(selectinload(ComputeManagerORM.log))
-                .where(ComputeManagerORM.name == name)
-                .with_for_update(skip_locked=False)
-            )
+            stmt = select(ComputeManagerORM).where(ComputeManagerORM.name == name).with_for_update(skip_locked=False)
             manager: Optional[ComputeManagerORM] = session.execute(stmt).scalar_one_or_none()
 
             if manager is None:
@@ -161,8 +121,6 @@ class ManagerSocket:
             manager.active_memory = active_memory
             manager.total_cpu_hours = total_cpu_hours
             manager.modified_on = now_at_utc()
-
-            self.save_snapshot(manager)
 
     def deactivate(
         self,
@@ -323,7 +281,7 @@ class ManagerSocket:
 
         return result_dicts
 
-    def check_manager_heartbeats(self, session: Session, job_progress: JobProgress) -> None:
+    def check_manager_heartbeats(self, session: Session) -> None:
         """
         Checks for manager heartbeats
 
@@ -335,30 +293,16 @@ class ManagerSocket:
         ----------
         session
             An existing SQLAlchemy session to use.
-        job_progress
-            An object used to report the current job progress and status
         """
         self._logger.debug("Checking manager heartbeats")
-        manager_window = self._manager_max_missed_heartbeats * self._manager_heartbeat_frequency
+
+        # Take into account the maximum jitter allowed
+        manager_window = self._manager_max_missed_heartbeats * (
+            self._manager_heartbeat_frequency + self._manager_heartbeat_frequency_jitter
+        )
         dt = now_at_utc() - timedelta(seconds=manager_window)
 
         dead_managers = self.deactivate(modified_before=dt, reason="missing heartbeat", session=session)
 
         if dead_managers:
             self._logger.info(f"Deactivated {len(dead_managers)} managers due to missing heartbeats")
-
-    ####################################################
-    # Some stuff to be retrieved for managers
-    ####################################################
-
-    def get_log(self, name: str, *, session: Optional[Session] = None) -> List[Dict[str, Any]]:
-        stmt = select(ComputeManagerORM)
-        stmt = stmt.options(defer("*"), lazyload("*"))
-        stmt = stmt.options(joinedload(ComputeManagerORM.log).options(undefer("*")))
-        stmt = stmt.where(ComputeManagerORM.name == name)
-
-        with self.root_socket.optional_session(session) as session:
-            rec = session.execute(stmt).unique().scalar_one_or_none()
-            if rec is None:
-                raise MissingDataError(f"Cannot find manager {name}")
-            return [x.model_dict() for x in rec.log]

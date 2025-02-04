@@ -15,11 +15,12 @@ dependencies:
   - pyyaml
   - pydantic
   - zstandard
-  - qcelemental
+  - apsw>=3.42
+  - qcelemental<0.70a0
   - tabulate
   - tqdm
   - pandas
-  - pyjwt
+  - pyjwt>=2.10.0
   - packaging
   - typing_extensions
   - python-dateutil
@@ -28,7 +29,7 @@ dependencies:
   # QCFractal dependencies
   - flask
   - flask-jwt-extended
-  - gunicorn
+  - waitress
   - bcrypt
   - sqlalchemy>=2.0
   - alembic
@@ -37,7 +38,6 @@ dependencies:
 
   # QCFractal Services
   - torsiondrive
-
-  - pip:
-      - "geometric @ git+https://github.com/hjnpark/geomeTRIC"
-      - scipy # for geometric
+  - qcmanybody
+  - geometric
+  - scipy # TODO Required for geometric REMOVE EVENTUALLY

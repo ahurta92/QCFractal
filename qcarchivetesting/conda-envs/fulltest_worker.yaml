@@ -1,7 +1,6 @@
 name: qcarchive-worker
 channels:
   - conda-forge
-  - conda-forge/label/libint_dev
   - defaults
 
 dependencies:
@@ -15,11 +14,12 @@ dependencies:
   - pyyaml
   - pydantic
   - zstandard
-  - qcelemental
+  - apsw>=3.42
+  - qcelemental<0.70a0
   - tabulate
   - tqdm
   - pandas
-  - pyjwt
+  - pyjwt>=2.10.0
   - packaging
   - typing_extensions
   - python-dateutil
@@ -29,11 +29,8 @@ dependencies:
   - parsl
 
   # Worker codes below
-  - qcengine
-  - psi4>=1.7
+  - qcengine<0.70a0
+  - psi4>=1.9.1
   - rdkit
-
-  # Geometric service
-  - pip:
-    - scipy
-    - "geometric @ git+https://github.com/hjnpark/geomeTRIC"
+  - geometric
+  - scipy # TODO Required for geometric REMOVE EVENTUALLY

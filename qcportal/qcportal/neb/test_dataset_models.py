@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import pytest
+
 import qcportal.dataset_testing_helpers as ds_helpers
 from qcarchivetesting import load_molecule_data
+from qcportal.dataset_testing_helpers import dataset_submit_test_client
 from qcportal.neb import NEBDatasetNewEntry, NEBKeywords, NEBSpecification
 from qcportal.record_models import PriorityEnum
 from qcportal.singlepoint.record_models import QCSpecification
@@ -39,7 +42,6 @@ test_specs = [
             average_force=0.025,
             optimize_ts=True,
             epsilon=1e-5,
-            hessian_reset=True,
             spring_type=0,
         ),
         singlepoint_specification=QCSpecification(
@@ -60,7 +62,6 @@ test_specs = [
             average_force=0.025,
             optimize_ts=True,
             epsilon=1e-5,
-            hessian_reset=True,
             spring_type=1,
         ),
         singlepoint_specification=QCSpecification(
@@ -81,7 +82,6 @@ test_specs = [
             average_force=0.025,
             optimize_ts=True,
             epsilon=1e-5,
-            hessian_reset=True,
             spring_type=0,
         ),
         singlepoint_specification=QCSpecification(
@@ -131,6 +131,11 @@ def test_neb_dataset_model_rename_entry(snowflake_client: PortalClient):
     ds_helpers.run_dataset_model_rename_entry(snowflake_client, ds, test_entries, test_specs)
 
 
+def test_neb_dataset_model_modify_entries(snowflake_client: PortalClient):
+    ds = snowflake_client.add_dataset("neb", "Test dataset")
+    ds_helpers.run_dataset_model_modify_entries(snowflake_client, ds, test_entries, test_specs)
+
+
 def test_neb_dataset_model_delete_entry(snowflake_client: PortalClient):
     ds = snowflake_client.add_dataset("neb", "Test dataset")
     ds_helpers.run_dataset_model_delete_entry(snowflake_client, ds, test_entries, test_specs)
@@ -161,11 +166,12 @@ def test_neb_dataset_model_remove_record(snowflake_client: PortalClient):
     ds_helpers.run_dataset_model_remove_record(snowflake_client, ds, test_entries, test_specs)
 
 
-def test_neb_dataset_model_submit(snowflake_client: PortalClient):
-    ds = snowflake_client.add_dataset(
-        "neb", "Test dataset", default_tag="default_tag", default_priority=PriorityEnum.low
+@pytest.mark.parametrize("background", [True, False])
+def test_neb_dataset_model_submit(dataset_submit_test_client: PortalClient, background):
+    ds = dataset_submit_test_client.add_dataset(
+        "neb", "Test dataset", default_tag="default_tag", default_priority=PriorityEnum.low, owner_group="group1"
     )
-    ds_helpers.run_dataset_model_submit(ds, test_entries, test_specs[0], record_compare)
+    ds_helpers.run_dataset_model_submit(ds, test_entries, test_specs[0], record_compare, background)
 
 
 def test_neb_dataset_model_submit_missing(snowflake_client: PortalClient):

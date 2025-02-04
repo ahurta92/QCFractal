@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 from qcfractal.components.dataset_socket import BaseDatasetSocket
 from qcfractal.components.manybody.record_db_models import ManybodyRecordORM
 from qcportal.manybody import ManybodyDatasetNewEntry, ManybodySpecification
+from qcportal.metadata_models import InsertMetadata, InsertCountsMetadata
 from qcportal.record_models import PriorityEnum
 from .dataset_db_models import (
     ManybodyDatasetORM,
@@ -17,7 +18,6 @@ from .dataset_db_models import (
 
 if TYPE_CHECKING:
     from sqlalchemy.orm.session import Session
-    from qcportal.metadata_models import InsertMetadata
     from qcfractal.db_socket.socket import SQLAlchemySocket
     from typing import Optional, Sequence, Iterable, Tuple
 
@@ -54,7 +54,7 @@ class ManybodyDatasetSocket(BaseDatasetSocket):
                 name=entry.name,
                 comment=entry.comment,
                 initial_molecule_id=molecule_id,
-                additional_keywords=entry.additional_keywords,
+                additional_singlepoint_keywords=entry.additional_singlepoint_keywords,
                 attributes=entry.attributes,
             )
 
@@ -74,10 +74,14 @@ class ManybodyDatasetSocket(BaseDatasetSocket):
         owner_user_id: Optional[int],
         owner_group_id: Optional[int],
         find_existing: bool,
-    ):
+    ) -> InsertCountsMetadata:
+
+        n_inserted = 0
+        n_existing = 0
+
         # Weed out any with additional keywords
-        special_entries = [x for x in entry_orm if x.additional_keywords]
-        normal_entries = [x for x in entry_orm if not x.additional_keywords]
+        special_entries = [x for x in entry_orm if x.additional_singlepoint_keywords]
+        normal_entries = [x for x in entry_orm if not x.additional_singlepoint_keywords]
 
         # Normal entries - just let it rip
         for spec in spec_orm:
@@ -101,6 +105,9 @@ class ManybodyDatasetSocket(BaseDatasetSocket):
                 )
                 session.add(rec)
 
+            n_inserted += meta.n_inserted
+            n_existing += meta.n_existing
+
         # Now the ones with additional keywords
         for spec in spec_orm:
             spec_obj = spec.specification.to_model(ManybodySpecification)
@@ -111,7 +118,8 @@ class ManybodyDatasetSocket(BaseDatasetSocket):
                     continue
 
                 new_spec = copy.deepcopy(spec_input_dict)
-                new_spec["keywords"].update(entry.additional_keywords)
+                for v in new_spec["levels"].values():
+                    v["keywords"].update(entry.additional_singlepoint_keywords)
 
                 meta, mb_ids = self.root_socket.records.manybody.add(
                     initial_molecules=[entry.initial_molecule_id],
@@ -132,3 +140,8 @@ class ManybodyDatasetSocket(BaseDatasetSocket):
                         record_id=mb_ids[0],
                     )
                     session.add(rec)
+
+                n_inserted += meta.n_inserted
+                n_existing += meta.n_existing
+
+        return InsertCountsMetadata(n_inserted=n_inserted, n_existing=n_existing)

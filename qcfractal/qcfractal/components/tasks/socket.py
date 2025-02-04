@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import traceback
+from collections import defaultdict
 from typing import TYPE_CHECKING
 
 try:
@@ -9,13 +10,12 @@ try:
 except ImportError:
     import pydantic
 from qcelemental.models import FailedOperation
-from sqlalchemy import select, func
+from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import array
-from sqlalchemy.orm import joinedload, aliased, Load
+from sqlalchemy.orm import joinedload, load_only, lazyload
 
 from qcfractal.components.managers.db_models import ComputeManagerORM
 from qcfractal.components.record_db_models import BaseRecordORM
-from qcfractal.components.services.db_models import ServiceQueueORM, ServiceDependencyORM
 from qcportal.all_results import AllResultTypes
 from qcportal.compression import CompressionEnum, compress
 from qcportal.compression import decompress
@@ -43,6 +43,7 @@ class TaskSocket:
         self._logger = logging.getLogger(__name__)
 
         self._tasks_claim_limit = root_socket.qcf_config.api_limits.manager_tasks_claim
+        self._strict_queue_tags = root_socket.qcf_config.strict_queue_tags
 
     def update_finished(
         self, manager_name: str, results_compressed: Dict[int, bytes], *, session: Optional[Session] = None
@@ -72,7 +73,6 @@ class TaskSocket:
 
         with self.root_socket.optional_session(session) as session:
             stmt = select(ComputeManagerORM).where(ComputeManagerORM.name == manager_name)
-            stmt = stmt.with_for_update(skip_locked=False)
             manager: Optional[ComputeManagerORM] = session.execute(stmt).scalar_one_or_none()
 
             if manager is None:
@@ -83,70 +83,84 @@ class TaskSocket:
                 self._logger.warning(f"Manager {manager_name} is not active. Ignoring...")
                 raise ComputeManagerError(f"Manager {manager_name} is not active")
 
-            all_notifications: List[Tuple[int, RecordStatusEnum]] = []
-
             # For automatic resetting
             to_be_reset: List[int] = []
 
+            # We load basic record & task info for all returned tasks with row-level locking.
+            # This lock is released on commit or rollback.
+            all_task_ids = list(results_compressed.keys())
+            stmt = select(
+                TaskQueueORM.id,
+                BaseRecordORM.id,
+                BaseRecordORM.record_type,
+                BaseRecordORM.status,
+                BaseRecordORM.manager_name,
+            )
+            stmt = stmt.join(TaskQueueORM, TaskQueueORM.record_id == BaseRecordORM.id)
+            stmt = stmt.where(TaskQueueORM.id.in_(all_task_ids))
+            stmt = stmt.with_for_update(skip_locked=False)
+
+            all_record_info = session.execute(stmt).all()
+            all_record_info = {x[0]: x[1:] for x in all_record_info}
+
             for task_id, result_compressed in results_compressed.items():
-                result_dict = decompress(result_compressed, CompressionEnum.zstd)
-                result = pydantic.parse_obj_as(AllResultTypes, result_dict)
 
-                # We load one at a time. This works well with 'with_for_update'
-                # which will do row locking. This lock is released on commit or rollback
-                # We are also deferring loading of the specific record tables. These will be lazy loaded
-                # when they are needed in the update functions of the various record subsockets.
-                # (I tried to use with_polymorphic, but it's kind of fussy and doesn't work well with innerjoin
-                #  which is needed because with_for_update doesn't work with nullable left outer joins. This should
-                #  be ok, even if the second select call doesn't use with_for_update, because any loading of
-                #  a derived-class orm will need to access base_record, which I believe will be locked)
-                stmt = select(TaskQueueORM).filter(TaskQueueORM.id == task_id)
-                stmt = stmt.options(joinedload(TaskQueueORM.record, innerjoin=True))
-                stmt = stmt.with_for_update(skip_locked=False)
+                record_info = all_record_info.get(task_id, None)
 
-                task_orm: Optional[TaskQueueORM] = session.execute(stmt).scalar_one_or_none()
-
-                # Does the task exist?
-                if task_orm is None:
+                #################################################################
+                # Perform some checks for consistency
+                # These are simple rejections and don't modify anything
+                # record-related in the database
+                #################################################################
+                if record_info is None:
                     self._logger.warning(f"Task id {task_id} does not exist in the task queue")
                     tasks_rejected.append((task_id, "Task does not exist in the task queue"))
                     continue
 
-                record_orm: BaseRecordORM = task_orm.record
-                record_id = record_orm.id
+                record_id, record_type, record_status, record_manager_name = record_info
 
-                # Start a nested transaction, so that we can rollback if there is an issue with
-                # an individual result without releasing the lock on the manager
-                nested_session = session.begin_nested()
+                # Is the task in the running state
+                # If so, do not attempt to modify the task queue. Just move on
+                if record_status != RecordStatusEnum.running:
+                    self._logger.warning(f"Record {record_id} (task {task_id}) is not in a running state")
+                    tasks_rejected.append((task_id, "Task is not in a running state"))
+                    continue
+
+                # Was the manager that sent the data the one that was assigned?
+                # If so, do not attempt to modify the task queue. Just move on
+                if record_manager_name != manager_name:
+                    self._logger.warning(
+                        f"Record {record_id} (task {task_id}) claimed by {record_manager_name}, not {manager_name}"
+                    )
+                    tasks_rejected.append((task_id, "Task is claimed by another manager"))
+                    continue
+
+                result_dict = decompress(result_compressed, CompressionEnum.zstd)
+                result = pydantic.parse_obj_as(AllResultTypes, result_dict)
 
                 notify_status = None
 
-                try:
-                    #################################################################
-                    # Perform some checks for consistency
-                    #################################################################
-                    # Is the task in the running state
-                    # If so, do not attempt to modify the task queue. Just move on
-                    if record_orm.status != RecordStatusEnum.running:
-                        self._logger.warning(f"Record {record_id} (task {task_id}) is not in a running state")
-                        tasks_rejected.append((task_id, "Task is not in a running state"))
+                ##################################################################
+                # The rest of the checks are done in a try/except block because
+                # they are much more complicated and can result in exceptions
+                # which should be handled
+                ##################################################################
 
-                    # Was the manager that sent the data the one that was assigned?
-                    # If so, do not attempt to modify the task queue. Just move on
-                    elif record_orm.manager_name != manager_name:
-                        self._logger.warning(
-                            f"Record {record_id} (task {task_id}) claimed by {record_orm.manager_name}, not {manager_name}"
-                        )
-                        tasks_rejected.append((task_id, "Task is claimed by another manager"))
+                try:
+                    savepoint = session.begin_nested()
 
                     # Failed task returning FailedOperation
-                    elif result.success is False and isinstance(result, FailedOperation):
-                        self.root_socket.records.update_failed_task(session, record_orm, result, manager_name)
+                    if result.success is False and isinstance(result, FailedOperation):
+                        self.root_socket.records.update_failed_task(session, record_id, result, manager_name)
+
                         notify_status = RecordStatusEnum.error
                         tasks_failures.append(task_id)
 
                         # Should we automatically reset?
                         if self.root_socket.qcf_config.auto_reset.enabled:
+                            # TODO - Move to update_failed_task?
+                            stmt = select(BaseRecordORM).where(BaseRecordORM.id == record_id)
+                            record_orm = session.execute(stmt).scalar_one()
                             if should_reset(record_orm, self.root_socket.qcf_config.auto_reset):
                                 to_be_reset.append(record_id)
 
@@ -156,7 +170,7 @@ class TaskSocket:
                         error = {"error_type": "internal_fractal_error", "error_message": msg}
                         failed_op = FailedOperation(error=error, success=False)
 
-                        self.root_socket.records.update_failed_task(session, record_orm, failed_op, manager_name)
+                        self.root_socket.records.update_failed_task(session, record_id, failed_op, manager_name)
                         notify_status = RecordStatusEnum.error
 
                         self._logger.error(msg)
@@ -164,52 +178,53 @@ class TaskSocket:
 
                     # Manager returned a full, successful result
                     else:
-                        self.root_socket.records.update_completed_task(session, record_orm, result, manager_name)
+                        self.root_socket.records.update_completed_task(
+                            session, record_id, record_type, result, manager_name
+                        )
 
                         notify_status = RecordStatusEnum.complete
                         tasks_success.append(task_id)
 
+                    savepoint.commit()  # Release the savepoint (doesn't actually fully commit)
+
                 except Exception:
                     # We have no idea what was added or is pending for removal
                     # So rollback the transaction to the most recent commit
-                    nested_session.rollback()
-
-                    # Need a new nested transaction - previous one is dead
-                    nested_session = session.begin_nested()
+                    savepoint.rollback()
+                    savepoint = session.begin_nested()
 
                     msg = "Internal FractalServer Error:\n" + traceback.format_exc()
                     error = {"error_type": "internal_fractal_error", "error_message": msg}
                     failed_op = FailedOperation(error=error, success=False)
 
-                    self.root_socket.records.update_failed_task(session, record_orm, failed_op, manager_name)
+                    self.root_socket.records.update_failed_task(session, record_id, failed_op, manager_name)
                     notify_status = RecordStatusEnum.error
 
                     self._logger.error(msg)
                     tasks_rejected.append((task_id, "Internal server error"))
 
-                finally:
-                    # releases the SAVEPOINT, does not actually commit to the db
-                    # (see SAVEPOINTS in postgres docs)
-                    nested_session.commit()
+                    savepoint.commit()
 
+                finally:
+                    # Send notifications that tasks were completed
+                    # Notifications are sent after the transaction is committed
                     if notify_status is not None:
-                        all_notifications.append((record_id, notify_status))
+                        self.root_socket.notify_finished_watch(record_id, notify_status)
+
+            session.commit()
 
             # Update the stats for the manager
             manager.successes += len(tasks_success)
             manager.failures += len(tasks_failures)
             manager.rejected += len(tasks_rejected)
 
-            session.flush()
+            # Mark that we have heard from the manager
+            manager.modified_on = now_at_utc()
 
             # Automatically reset ones that should be reset
             if self.root_socket.qcf_config.auto_reset.enabled and to_be_reset:
                 self._logger.info(f"Auto resetting {len(to_be_reset)} records")
                 self.root_socket.records.reset(to_be_reset, session=session)
-
-        # Send notifications that tasks were completed
-        for record_id, notify_status in all_notifications:
-            self.root_socket.notify_finished_watch(record_id, notify_status)
 
         self._logger.info(
             "Processed {} returned tasks ({} successful, {} failed, {} rejected).".format(
@@ -250,22 +265,9 @@ class TaskSocket:
         # to claim absolutely everything. So double check here
         limit = calculate_limit(self._tasks_claim_limit, limit)
 
-        # CTE for finding the created_on from services which this record is a dependency of
-        # If a record is a dependency of a service, we use either the record's created_on or the service's created_on,
-        # whichever is earlier. That way a service doesn't have to wait for all other services to finish their tasks
-        # before it can finish.
-        br_task = aliased(BaseRecordORM)  # BaseRecord for the task
-        br_svc = aliased(BaseRecordORM)  # BaseRecord for services
-
-        least_date = func.least(br_task.created_on, func.min(br_svc.created_on)).label("created_on")
-        svcdate_cte = select(br_task.id.label("record_id"), least_date)
-        svcdate_cte = svcdate_cte.join(ServiceDependencyORM, ServiceDependencyORM.record_id == br_task.id)
-        svcdate_cte = svcdate_cte.join(ServiceQueueORM, ServiceQueueORM.id == ServiceDependencyORM.service_id)
-        svcdate_cte = svcdate_cte.join(br_svc, br_svc.id == ServiceQueueORM.record_id)
-        svcdate_cte = svcdate_cte.where(br_task.status == RecordStatusEnum.waiting)
-        svcdate_cte = svcdate_cte.group_by(br_task.id)
-        svcdate_cte = svcdate_cte.order_by(least_date.asc())
-        svcdate_cte = svcdate_cte.cte()
+        # Force given tags and programs to be lower case
+        tags = [tag.lower() for tag in tags]
+        programs = {key.lower(): [x.lower() for x in value] for key, value in programs.items()}
 
         with self.root_socket.optional_session(session) as session:
             stmt = select(ComputeManagerORM).where(ComputeManagerORM.name == manager_name)
@@ -279,11 +281,22 @@ class TaskSocket:
                 self._logger.warning(f"Manager {manager_name} exists but is not active! Will not give it tasks")
                 raise ComputeManagerError("Manager is not active!")
 
-            manager_programs = array(programs.keys())
-            found: List[Dict[str, Any]] = []
-
-            # Remove tags that we didn't say we handled, but keep the order
+            # Remove tags & programs that we didn't say we handled
+            # (order is important for tags)
+            search_programs = array(p for p in programs.keys() if p in manager.programs.keys())
             search_tags = [x for x in tags if x in manager.tags]
+
+            if len(search_programs) == 0:
+                self._logger.warning(f"Manager {manager_name} did not send any valid programs to claim")
+                raise ComputeManagerError(f"Manager {manager_name} did not send any valid programs to claim")
+
+            if len(search_tags) == 0:
+                self._logger.warning(f"Manager {manager_name} did not send any valid queue tags to claim")
+                raise ComputeManagerError(f"Manager {manager_name} did not send any valid queue tags to claim")
+
+            found: Dict[int, Dict[str, Any]] = {}
+            return_order: List[int] = []  # Order of task ids
+
             for tag in search_tags:
                 new_limit = limit - len(found)
 
@@ -302,30 +315,25 @@ class TaskSocket:
                 # TODO - we only test for the presence of the available_programs in the requirements. Eventually
                 #        we want to then verify the versions
 
-                # We do a plain .join() because we are querying, and then also supplying contains_eager() so that
-                # the TaskQueueORM.record gets populated
-                # See https://docs-sqlalchemy.readthedocs.io/ko/latest/orm/loading_relationships.html#routing-explicit-joins-statements-into-eagerly-loaded-collections
-                stmt = select(TaskQueueORM, BaseRecordORM).join(TaskQueueORM.record)
-
-                # Only load a few columns we need of the record
-                stmt = stmt.options(
-                    Load(BaseRecordORM).load_only(
-                        BaseRecordORM.status, BaseRecordORM.manager_name, BaseRecordORM.modified_on
-                    )
+                # This is a very tricky query. We only want to load two columns of BaseRecord, but we need to join.
+                # Sqlalchemy likes to load more columns if there is a relationship. So we join outside of the
+                # relationship (ie, NOT TaskQueueORM.record) and then load the columns we want.
+                stmt = select(TaskQueueORM, BaseRecordORM).join(
+                    BaseRecordORM, BaseRecordORM.id == TaskQueueORM.record_id
                 )
 
-                stmt = stmt.join(svcdate_cte, svcdate_cte.c.record_id == BaseRecordORM.id, isouter=True)
-                stmt = stmt.filter(BaseRecordORM.status == RecordStatusEnum.waiting)
-                stmt = stmt.filter(manager_programs.contains(TaskQueueORM.required_programs))
+                stmt = stmt.filter(TaskQueueORM.available == True)
+                stmt = stmt.filter(search_programs.contains(TaskQueueORM.required_programs))
+                stmt = stmt.options(load_only(BaseRecordORM.id, BaseRecordORM.record_type))
+                stmt = stmt.options(lazyload(BaseRecordORM.owner_user), lazyload(BaseRecordORM.owner_group))
 
-                # Order by priority, then created_on (earliest first)
-                # Where the created_on may be the created_on of the parent service (see CTE above)
-                stmt = stmt.order_by(
-                    TaskQueueORM.priority.desc(), func.least(BaseRecordORM.created_on, svcdate_cte.c.created_on).asc()
-                )
+                # Order by priority, then date (earliest first)
+                # The sort_date usually comes from the created_on of the record, or the created_on of the record's parent service
+                stmt = stmt.order_by(TaskQueueORM.priority.desc(), TaskQueueORM.sort_date.asc(), TaskQueueORM.id.asc())
 
-                # If tag is "*", then the manager will pull anything
-                if tag != "*":
+                # If tag is "*" (and strict_queue_tags is False), then the manager can pull anything
+                # If tag is "*" and strict_queue_tags is enabled, only pull tasks with tag == '*'
+                if tag != "*" or self._strict_queue_tags:
                     stmt = stmt.filter(TaskQueueORM.tag == tag)
 
                 # Skip locked rows - They may be in the process of being claimed by someone else
@@ -334,38 +342,72 @@ class TaskSocket:
                 new_items = session.execute(stmt).all()
 
                 # Update all the task records to reflect this manager claiming them
-                for _, record_orm in new_items:
-                    record_orm.status = RecordStatusEnum.running
-                    record_orm.manager_name = manager_name
-                    record_orm.modified_on = now_at_utc()
+                task_ids = [x[0].id for x in new_items]
+                record_ids = [x[1].id for x in new_items]
+
+                return_order.extend(task_ids)  # Keep the order as returned from the db
+                stmt = update(TaskQueueORM).where(TaskQueueORM.id.in_(task_ids)).values(available=False)
+                session.execute(stmt)
+
+                stmt = (
+                    update(BaseRecordORM)
+                    .where(BaseRecordORM.id.in_(record_ids))
+                    .values(status=RecordStatusEnum.running, manager_name=manager_name, modified_on=now_at_utc())
+                )
+                session.execute(stmt)
 
                 # Store in dict form for returning, but no need to store the info from the base record
                 # Also, retrieve the actual function kwargs. Eventually we may want the managers
                 # to retrieve the kwargs themselves
-                for task_orm, _ in new_items:
-                    task_dict = task_orm.model_dict(exclude=["record"])
+                tasks_to_generate = defaultdict(list)
+                task_updates = []
 
+                # Find what tasks need their function and kwargs generated
+                # Otherwise, just add them to the returned list
+                for task_orm, record_orm in new_items:
                     if task_orm.function is None:
-                        # Generate the task on the fly
-                        task_spec = self.root_socket.records.generate_task_specification(task_orm)
+                        tasks_to_generate[record_orm.record_type].append(task_orm)
+                    else:
+                        found[task_orm.id] = task_orm.model_dict(exclude=["record"])
+
+                # Create the task data on the fly if it doesn't exist
+                for record_type, tasks_orm in tasks_to_generate.items():
+                    record_socket = self.root_socket.records.get_socket(record_type)
+
+                    record_ids = [task_orm.record_id for task_orm in tasks_orm]
+                    task_specs = record_socket.generate_task_specifications(session, record_ids)
+
+                    for task_orm, task_spec in zip(tasks_orm, task_specs):
+                        task_dict = task_orm.model_dict(exclude=["record"])
 
                         kwargs = task_spec["function_kwargs"]
                         kwargs_compressed, _, _ = compress(kwargs, CompressionEnum.zstd)
 
                         # Add this to the orm for any future managers claiming this task
-                        task_orm.function = task_spec["function"]
-                        task_orm.function_kwargs_compressed = kwargs_compressed
+                        task_updates.append(
+                            {
+                                "id": task_orm.id,
+                                "function": task_spec["function"],
+                                "function_kwargs_compressed": kwargs_compressed,
+                            }
+                        )
 
                         # But just use what we created when returning to this manager
                         task_dict["function"] = task_spec["function"]
                         task_dict["function_kwargs_compressed"] = kwargs_compressed
+                        found[task_orm.id] = task_dict
 
-                    found.append(task_dict)
+                # Update the task records with the function and kwargs
+                if task_updates:
+                    session.execute(update(TaskQueueORM), task_updates)
 
                 session.flush()
 
             manager.claimed += len(found)
 
+            # Mark that we have heard from the manager
+            manager.modified_on = now_at_utc()
+
             self._logger.info(f"Manager {manager_name} has claimed {len(found)} new tasks")
 
-        return found
+        return [found[i] for i in return_order]

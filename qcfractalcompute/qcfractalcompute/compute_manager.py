@@ -29,7 +29,7 @@ from qcportal import ManagerClient
 from qcportal.managers import ManagerName
 from qcportal.metadata_models import TaskReturnMetadata
 from qcportal.record_models import RecordTask
-from qcportal.utils import seconds_to_hms
+from qcportal.utils import seconds_to_hms, apply_jitter
 from . import __version__
 from .apps.models import AppTaskResult
 from .compress import compress_result
@@ -131,18 +131,33 @@ class ComputeManager:
         self._record_id_map: Dict[int, int] = {}
 
         self.all_queue_tags = []
-        for ex_config in config.executors.values():
+        for ex_label, ex_config in config.executors.items():
+            if len(ex_config.queue_tags) == 0:
+                raise ValueError(f"Executor {ex_label} has no queue tags")
+
             self.all_queue_tags.extend(ex_config.queue_tags)
+
+        # Merge queue tags, preserving order
+        self.all_queue_tags = list(dict.fromkeys(self.all_queue_tags))
 
         # These are more properly set up in the start() method
         self.parsl_config = None
         self.dflow_kernel = None
 
         # Set up the app manager
-        self.app_manager = AppManager(self.manager_config)
-        self.executor_programs = {
-            ex: self.app_manager.all_program_info(ex) for ex in self.manager_config.executors.keys()
-        }
+        # A bit hacky, but the app_manager may already be set if
+        # we are running in a testing environment
+        if not hasattr(self, "app_manager"):
+            self.app_manager = AppManager(self.manager_config)
+
+        self.executor_programs = {}
+        for ex in self.manager_config.executors.keys():
+            ex_programs = self.app_manager.all_program_info(ex)
+            if len(ex_programs) == 0:
+                raise ValueError(f"Executor {ex} has no available programs")
+
+            self.executor_programs[ex] = ex_programs
+
         self.all_program_info = self.app_manager.all_program_info()
 
         self.logger.info("-" * 80)
@@ -170,6 +185,7 @@ class ComputeManager:
         # Pull server info
         self.server_info = self.client.get_server_information()
         self.heartbeat_frequency = self.server_info["manager_heartbeat_frequency"]
+        self.heartbeat_frequency_jitter = self.server_info.get("manager_heartbeat_frequency_jitter", 0.0)
 
         self.client.activate(__version__, self.all_program_info, tags=self.all_queue_tags)
 
@@ -187,6 +203,9 @@ class ComputeManager:
 
         # Number of failed heartbeats. After missing a bunch, we will shutdown
         self._failed_heartbeats = 0
+
+        # Time at which the worker started idling (no jobs being run)
+        self._idle_start_time = None
 
     @staticmethod
     def _get_max_workers(executor: ParslExecutor) -> int:
@@ -255,7 +274,10 @@ class ComputeManager:
         # Set up Parsl executors and DataFlowKernel
         ###########################################
         self.parsl_config = ParslConfig(
-            executors=[], initialize_logging=False, run_dir=self.manager_config.parsl_run_dir
+            executors=[],
+            initialize_logging=False,
+            run_dir=self.manager_config.parsl_run_dir,
+            usage_tracking=self.manager_config.parsl_usage_tracking,
         )
         self.dflow_kernel = DataFlowKernel(self.parsl_config)
 
@@ -267,17 +289,23 @@ class ComputeManager:
             if not manual_updates:
                 self.update(new_tasks=True)
             if not self._is_stopping:
-                self.scheduler.enter(self.manager_config.update_frequency, 1, scheduler_update)
+                delay = apply_jitter(self.manager_config.update_frequency, self.manager_config.update_frequency_jitter)
+                self.scheduler.enter(delay, 1, scheduler_update)
 
         def scheduler_heartbeat():
             if not manual_updates:
                 self.heartbeat()
             if not self._is_stopping:
-                self.scheduler.enter(self.heartbeat_frequency, 1, scheduler_heartbeat)
+                delay = apply_jitter(self.heartbeat_frequency, self.heartbeat_frequency_jitter)
+                self.scheduler.enter(delay, 1, scheduler_heartbeat)
 
         self.logger.info("Compute Manager successfully started.")
 
         self._failed_heartbeats = 0
+
+        # Start the idle timer to be right now, since we aren't doing anything
+        self._idle_start_time = time.time()
+
         self.scheduler.enter(0, 1, scheduler_update)
         self.scheduler.enter(0, 2, scheduler_heartbeat)
 
@@ -484,16 +512,7 @@ class ComputeManager:
         self._deferred_tasks = new_deferred_tasks
         return ret
 
-    def update(self, new_tasks) -> None:
-        """Examines the queue for completed tasks and adds successful completions to the database
-        while unsuccessful are logged for future inspection.
-
-        Parameters
-        ----------
-        new_tasks
-            Try to get new tasks from the server
-        """
-
+    def _update(self, new_tasks) -> None:
         # First, try pushing back any stale results
         deferred_return_info = self._update_deferred_tasks()
 
@@ -641,6 +660,40 @@ class ComputeManager:
                     # Add new tasks to queue
                     self.preprocess_new_tasks(new_task_info)
                     self._submit_tasks(executor_label, new_task_info)
+
+    def update(self, new_tasks) -> None:
+        """Examines the queue for completed tasks and adds successful completions to the database
+        while unsuccessful are logged for future inspection.
+
+        Parameters
+        ----------
+        new_tasks
+            Try to get new tasks from the server
+        """
+
+        self._update(new_tasks=new_tasks)
+
+        if self.manager_config.max_idle_time is None:
+            return
+
+        # Check if we are idle. If we are beyond the max idle time, then shut down
+        is_idle = (self.n_total_active_tasks == 0) and (self.n_deferred_tasks == 0)
+
+        if is_idle and self._idle_start_time is None:
+            self._idle_start_time = time.time()
+
+        if not is_idle:
+            self._idle_start_time = None
+        else:
+            idle_time = time.time() - self._idle_start_time
+            if idle_time >= self.manager_config.max_idle_time:
+                self.logger.warning(
+                    f"Manager has been idle for {idle_time:.2f} seconds - max is "
+                    f"{self.manager_config.max_idle_time}, shutting down"
+                )
+                self.stop()
+            else:
+                self.logger.info(f"Manager has been idle for {idle_time:.2f} seconds")
 
     def preprocess_new_tasks(self, new_tasks: List[RecordTask]):
         """

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Tuple, Optional
 from urllib.parse import urlparse
+from qcfractal import __version__ as qcfractal_version
 
 from flask import request, g, current_app
 from flask_jwt_extended import (
@@ -11,6 +12,7 @@ from flask_jwt_extended import (
     create_access_token,
     create_refresh_token,
 )
+from jwt.exceptions import InvalidSubjectError
 from werkzeug.exceptions import BadRequest, Forbidden
 
 from qcfractal.flask_app import storage_socket
@@ -78,6 +80,10 @@ def assert_role_permissions(requested_action: str):
         role = claims.get("role", None)
         groups = claims.get("groups", None)
 
+        # user_id is stored in the JWT as a string
+        if user_id is not None:
+            user_id = int(user_id)
+
         subject = {"user_id": user_id, "username": username}
 
         # Pull the first part of the URL (ie, /api/v1/molecule/a/b/c -> /api/v1/molecule)
@@ -105,7 +111,7 @@ def access_token_from_user(user_info: UserInfo, role_info: RoleInfo):
     Creates a JWT access token from user/role information
     """
     return create_access_token(
-        identity=user_info.id,
+        identity=str(user_info.id),
         additional_claims={
             "username": user_info.username,
             "role": user_info.role,
@@ -161,9 +167,30 @@ def login_and_get_jwt(get_refresh_token: bool) -> Tuple[str, Optional[str]]:
     access_token = access_token_from_user(user_info, role_info)
 
     if get_refresh_token:
-        refresh_token = create_refresh_token(identity=user_info.id)
+        refresh_token = create_refresh_token(identity=str(user_info.id))
     else:
         refresh_token = None
 
     current_app.logger.info(f"Successful login for user {username}")
     return access_token, refresh_token
+
+
+def get_public_server_information():
+    qcf_cfg = current_app.config["QCFRACTAL_CONFIG"]
+
+    # TODO - remove version limits after a while. They are there to support older clients
+    public_info = {
+        "name": qcf_cfg.name,
+        "manager_heartbeat_frequency": qcf_cfg.heartbeat_frequency,
+        "manager_heartbeat_frequency_jitter": qcf_cfg.heartbeat_frequency_jitter,
+        "manager_heartbeat_max_missed": qcf_cfg.heartbeat_max_missed,
+        "version": qcfractal_version,
+        "api_limits": qcf_cfg.api_limits.dict(),
+        "client_version_lower_limit": "0.50",
+        "client_version_upper_limit": "1.00",
+        "manager_version_lower_limit": "0.50",
+        "manager_version_upper_limit": "1.00",
+        "motd": storage_socket.serverinfo.get_motd(),
+    }
+
+    return public_info

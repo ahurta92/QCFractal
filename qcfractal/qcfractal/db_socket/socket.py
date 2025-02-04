@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from functools import lru_cache
 from typing import TYPE_CHECKING
 
-from sqlalchemy import create_engine, exc, event, inspect, select, union, MetaData
+from sqlalchemy import create_engine, exc, event, inspect, select, union, MetaData, Engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import NullPool
 
@@ -85,7 +85,7 @@ class SQLAlchemySocket:
                 )
 
         # Check to see if the db is up-to-date
-        self.check_db_revision()
+        self._check_db_revision(self.engine)
 
         self.Session = sessionmaker(bind=self.engine, future=True)
 
@@ -100,6 +100,7 @@ class SQLAlchemySocket:
         from ..components.managers.socket import ManagerSocket
         from ..components.tasks.socket import TaskSocket
         from ..components.services.socket import ServiceSocket
+        from ..components.external_files import ExternalFileSocket
         from ..components.record_socket import RecordSocket
         from ..components.dataset_socket import DatasetSocket
 
@@ -111,6 +112,7 @@ class SQLAlchemySocket:
         self.molecules = MoleculeSocket(self)
         self.datasets = DatasetSocket(self)
         self.records = RecordSocket(self)
+        self.external_files = ExternalFileSocket(self)
         self.tasks = TaskSocket(self)
         self.services = ServiceSocket(self)
         self.managers = ManagerSocket(self)
@@ -121,19 +123,6 @@ class SQLAlchemySocket:
 
     def __str__(self) -> str:
         return f"<SQLAlchemySocket: address='{self.qcf_config.database.safe_uri}`>"
-
-    def post_fork_cleanup(self):
-        """
-        Do some cleanup after forking inside gunicorn
-
-        We use synchronous workers, which are spawned via fork(). Howver,
-        this would cause multiple processes to share the same db connections.
-        We must dispose of them (from the global storage_socket object).
-
-        https://docs.sqlalchemy.org/en/14/core/pooling.html#using-connection-pools-with-multiprocessing-or-os-fork
-        """
-
-        self.engine.dispose()
 
     @staticmethod
     def alembic_commands(db_config: DatabaseConfig) -> List[str]:
@@ -244,9 +233,10 @@ class SQLAlchemySocket:
         alembic_cfg = SQLAlchemySocket.get_alembic_config(db_config)
         command.upgrade(alembic_cfg, revision)
 
-    def check_db_revision(self):
+    @staticmethod
+    def _check_db_revision(engine: Engine):
         """
-        Checks to make sure the database is up-to-date
+        Checks to make sure the database is up-to-date, given an engine
 
         Will raise an exception if it is not up-to-date
         """
@@ -258,7 +248,7 @@ class SQLAlchemySocket:
         script = ScriptDirectory(script_dir)
         heads = script.get_heads()
 
-        conn = self.engine.connect()
+        conn = engine.connect()
         context = MigrationContext.configure(connection=conn)
         current_rev = context.get_current_revision()
 
@@ -272,6 +262,17 @@ class SQLAlchemySocket:
                 )
         finally:
             conn.close()
+
+    @staticmethod
+    def check_db_revision(db_config: DatabaseConfig):
+        """
+        Checks to make sure the database is up-to-date, given a configuration
+
+        Will raise an exception if it is not up-to-date
+        """
+
+        engine = create_engine(db_config.sqlalchemy_url, echo=False, poolclass=NullPool, future=True)
+        SQLAlchemySocket._check_db_revision(engine)
 
     @contextmanager
     def session_scope(self, read_only: bool = False):

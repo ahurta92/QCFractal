@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
-from qcportal.molecules import Molecule
 
 import pytest
 
 from qcfractal.components.singlepoint.testing_helpers import load_test_data, run_test_data
 from qcportal import PortalRequestError
+from qcportal.molecules import Molecule
 from qcportal.record_models import PriorityEnum, RecordStatusEnum
 from qcportal.singlepoint import SinglepointDatasetNewEntry, SinglepointDataset
 
@@ -170,6 +170,8 @@ def test_dataset_model_add_submit_many(snowflake_client: PortalClient):
         "test_spec_2", specification={"program": "test_prog_2", "driver": "energy", "method": "HF", "basis": "sto-3g"}
     )
 
-    ds.submit()
+    meta = ds.submit()
+    assert meta.n_inserted == test_count * 2
+    assert meta.n_existing == 0
 
     assert ds.record_count == test_count * 2

@@ -3,10 +3,9 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from qcelemental.models import AtomicInput as QCEl_AtomicInput, AtomicResult as QCEl_AtomicResult
-from sqlalchemy import select
-from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.orm import lazyload, joinedload, defer, undefer, defaultload
+from qcelemental.models import AtomicResult as QCEl_AtomicResult
+from sqlalchemy import select, or_
+from sqlalchemy.orm import lazyload, joinedload, defer, undefer, defaultload, load_only, selectinload
 
 from qcfractal.db_socket.helpers import insert_general
 from qcportal.compression import CompressionEnum, compress
@@ -14,12 +13,13 @@ from qcportal.exceptions import MissingDataError
 from qcportal.metadata_models import InsertMetadata
 from qcportal.molecules import Molecule
 from qcportal.record_models import PriorityEnum, RecordStatusEnum
+from qcportal.serialization import convert_numpy_recursive
 from qcportal.singlepoint import (
     QCSpecification,
     WavefunctionProperties,
     SinglepointQueryFilters,
 )
-from qcportal.utils import hash_dict
+from qcportal.utils import hash_dict, is_included
 from .record_db_models import QCSpecificationORM, SinglepointRecordORM, WavefunctionORM
 from ..record_socket import BaseRecordSocket
 
@@ -30,6 +30,7 @@ if TYPE_CHECKING:
 
 # Meaningless, but unique to singlepoints
 singlepoint_insert_lock_id = 14000
+singlepoint_spec_insert_lock_id = 14001
 
 
 class SinglepointRecordSocket(BaseRecordSocket):
@@ -48,94 +49,190 @@ class SinglepointRecordSocket(BaseRecordSocket):
     def get_children_select() -> List[Any]:
         return []
 
-    def generate_task_specification(self, record_orm: SinglepointRecordORM) -> Dict[str, Any]:
-        specification = record_orm.specification
-        molecule = record_orm.molecule.model_dict()
-
-        model = {"method": specification.method}
-        if specification.basis:
-            model["basis"] = specification.basis
-
-        qcschema_input = QCEl_AtomicInput(
-            id=record_orm.id,
-            driver=specification.driver,
-            model=model,
-            molecule=molecule,
-            keywords=specification.keywords,
-            protocols=specification.protocols,
+    def generate_task_specifications(self, session: Session, record_ids: Sequence[int]) -> List[Dict[str, Any]]:
+        stmt = select(SinglepointRecordORM).filter(SinglepointRecordORM.id.in_(record_ids))
+        stmt = stmt.options(load_only(SinglepointRecordORM.id, SinglepointRecordORM.extras))
+        stmt = stmt.options(
+            lazyload("*"), joinedload(SinglepointRecordORM.molecule), selectinload(SinglepointRecordORM.specification)
         )
 
-        return {
-            "function": "qcengine.compute",
-            "function_kwargs": {
-                "input_data": qcschema_input.dict(encoding="json"),
-                "program": specification.program,
-            },
-        }
+        record_orms = session.execute(stmt).scalars().all()
 
-    def wavefunction_to_orm(
-        self, session: Session, wavefunction: Optional[WavefunctionProperties]
-    ) -> Optional[WavefunctionORM]:
+        task_specs = {}
+
+        for record_orm in record_orms:
+            specification = record_orm.specification
+            molecule = record_orm.molecule.model_dict()
+
+            model = {"method": specification.method}
+
+            # Empty basis string should be None in the model
+            if specification.basis:
+                model["basis"] = specification.basis
+            else:
+                model["basis"] = None
+
+            qcschema_input = dict(
+                schema_name="qcschema_input",
+                schema_version=1,
+                id=str(record_orm.id),  # str for compatibility
+                driver=specification.driver,
+                model=model,
+                molecule=convert_numpy_recursive(molecule, flatten=True),  # TODO - remove after all data is converted
+                keywords=specification.keywords,
+                protocols=specification.protocols,
+                extras=record_orm.extras if record_orm.extras else {},
+            )
+
+            task_specs[record_orm.id] = {
+                "function": "qcengine.compute",
+                "function_kwargs": {
+                    "input_data": qcschema_input,
+                    "program": specification.program,
+                },
+            }
+
+        if set(record_ids) != set(task_specs.keys()):
+            raise RuntimeError("Did not generate all task specs for all singlepoint records?")
+
+        # Return in the input order
+        return [task_specs[rid] for rid in record_ids]
+
+    def create_wavefunction_orm(self, wavefunction: WavefunctionProperties) -> WavefunctionORM:
         """
         Convert a QCElemental wavefunction into a wavefunction ORM
         """
 
-        if wavefunction is None:
-            return None
-
         wfn_dict = wavefunction.dict(encoding="json")
         cdata, ctype, clevel = compress(wfn_dict, CompressionEnum.zstd)
 
-        wfn_orm = WavefunctionORM(compression_type=ctype, compression_level=clevel, data=cdata)
+        return WavefunctionORM(compression_type=ctype, compression_level=clevel, data=cdata)
 
-        return wfn_orm
-
-    def update_completed_task(
-        self, session: Session, record_orm: SinglepointRecordORM, result: QCEl_AtomicResult, manager_name: str
-    ) -> None:
+    def update_completed_task(self, session: Session, record_id: int, result: QCEl_AtomicResult) -> None:
         # Update the fields themselves
-        record_orm.wavefunction = self.wavefunction_to_orm(session, result.wavefunction)
+        if result.wavefunction:
+            wavefunction_orm = self.create_wavefunction_orm(result.wavefunction)
+            wavefunction_orm.record_id = record_id
+            session.add(wavefunction_orm)
 
-    def insert_complete_record(
+    def insert_complete_schema_v1(
         self,
         session: Session,
-        result: QCEl_AtomicResult,
-    ) -> SinglepointRecordORM:
-        qc_spec = QCSpecification(
-            program=result.provenance.creator.lower(),
-            driver=result.driver,
-            method=result.model.method,
-            basis=result.model.basis,
-            keywords=result.keywords,
-            protocols=result.protocols,
-        )
+        results: Sequence[QCEl_AtomicResult],
+    ) -> List[SinglepointRecordORM]:
 
-        spec_meta, spec_id = self.add_specification(qc_spec, session=session)
-        if not spec_meta.success:
-            raise RuntimeError(
-                "Aborted single point insertion - could not add specification: " + spec_meta.error_string
+        ret = []
+
+        mols = []
+        qc_specs = []
+
+        for result in results:
+            mols.append(result.molecule)
+
+            qc_spec = QCSpecification(
+                program=result.provenance.creator.lower(),
+                driver=result.driver,
+                method=result.model.method,
+                basis=result.model.basis,
+                keywords=result.keywords,
+                protocols=result.protocols,
+            )
+            qc_specs.append(qc_spec)
+
+        meta, spec_ids = self.root_socket.records.singlepoint.add_specifications(qc_specs, session=session)
+        if not meta.success:
+            raise RuntimeError("Aborted single point insertion - could not add specifications: " + meta.error_string)
+
+        meta, mol_ids = self.root_socket.molecules.add(mols, session=session)
+        if not meta.success:
+            raise RuntimeError("Aborted single point insertion - could not add molecules: " + meta.error_string)
+
+        for result, mol_id, spec_id in zip(results, mol_ids, spec_ids):
+            record_orm = SinglepointRecordORM(
+                specification_id=spec_id,
+                molecule_id=mol_id,
+                status=RecordStatusEnum.complete,
             )
 
-        mol_meta, mol_ids = self.root_socket.molecules.add([result.molecule], session=session)
-        if not mol_meta.success:
-            raise RuntimeError("Aborted single point insertion - could not add molecule: " + spec_meta.error_string)
+            if result.wavefunction:
+                record_orm.wavefunction = self.create_wavefunction_orm(result.wavefunction)
 
-        record_orm = SinglepointRecordORM()
-        record_orm.is_service = False
-        record_orm.specification_id = spec_id
-        record_orm.molecule_id = mol_ids[0]
-        record_orm.status = RecordStatusEnum.complete
-        record_orm.wavefunction = self.wavefunction_to_orm(session, result.wavefunction)
+            ret.append(record_orm)
 
-        session.add(record_orm)
-        session.flush()
-        return record_orm
+        return ret
+
+    def add_specifications(
+        self, qc_specs: Sequence[QCSpecification], *, session: Optional[Session] = None
+    ) -> Tuple[InsertMetadata, List[int]]:
+        """
+        Adds specifications for singlepoint calculations to the database, returning their IDs.
+
+        If an identical specification exists, then no insertion takes place and the id of the existing
+        specification is returned.
+
+        Specification IDs are returned in the same order as the input specifications
+
+        Parameters
+        ----------
+        qc_specs
+            Sequence of specifications to add to the database
+        session
+            An existing SQLAlchemy session to use. If None, one will be created. If an existing session
+            is used, it will be flushed (but not committed) before returning from this function.
+
+        Returns
+        -------
+        :
+            Metadata about the insertion, and the IDs of the specifications.
+        """
+
+        to_add = []
+
+        for qc_spec in qc_specs:
+            protocols_dict = qc_spec.protocols.dict(exclude_defaults=True)
+
+            # TODO - if error_correction is manually specified as the default, then it will be an empty dict
+            if "error_correction" in protocols_dict:
+                erc = protocols_dict["error_correction"]
+                pol = erc.get("policies", dict())
+                if len(pol) == 0:
+                    erc.pop("policies", None)
+                if len(erc) == 0:
+                    protocols_dict.pop("error_correction")
+
+            qc_spec_dict = qc_spec.dict(exclude={"basis", "protocols"})
+            qc_spec_dict["basis"] = "" if qc_spec.basis is None else qc_spec.basis
+            qc_spec_dict["protocols"] = protocols_dict
+            qc_spec_hash = hash_dict(qc_spec_dict)
+
+            qc_spec_orm = QCSpecificationORM(
+                specification_hash=qc_spec_hash,
+                program=qc_spec_dict["program"],
+                driver=qc_spec_dict["driver"],
+                method=qc_spec_dict["method"],
+                basis=qc_spec_dict["basis"],
+                keywords=qc_spec_dict["keywords"],
+                protocols=qc_spec_dict["protocols"],
+            )
+
+            to_add.append(qc_spec_orm)
+
+        with self.root_socket.optional_session(session, False) as session:
+            meta, ids = insert_general(
+                session,
+                to_add,
+                (QCSpecificationORM.specification_hash,),
+                (QCSpecificationORM.id,),
+                singlepoint_spec_insert_lock_id,
+            )
+
+            return meta, [x[0] for x in ids]
 
     def add_specification(
         self, qc_spec: QCSpecification, *, session: Optional[Session] = None
     ) -> Tuple[InsertMetadata, Optional[int]]:
         """
-        Adds a specification for a singlepoint calculation to the database, returning its id.
+        Adds a single specification for a singlepoint calculation to the database, returning its id.
 
         If an identical specification exists, then no insertion takes place and the id of the existing
         specification is returned.
@@ -154,52 +251,39 @@ class SinglepointRecordSocket(BaseRecordSocket):
             Metadata about the insertion, and the id of the specification.
         """
 
-        protocols_dict = qc_spec.protocols.dict(exclude_defaults=True)
+        meta, ids = self.add_specifications([qc_spec], session=session)
 
-        # TODO - if error_correction is manually specified as the default, then it will be an empty dict
-        if "error_correction" in protocols_dict:
-            erc = protocols_dict["error_correction"]
-            pol = erc.get("policies", dict())
-            if len(pol) == 0:
-                erc.pop("policies", None)
-            if len(erc) == 0:
-                protocols_dict.pop("error_correction")
+        if not ids:
+            return meta, None
 
-        basis = "" if qc_spec.basis is None else qc_spec.basis
-        kw_hash = hash_dict(qc_spec.keywords)
+        return meta, ids[0]
 
-        with self.root_socket.optional_session(session, False) as session:
-            stmt = (
-                insert(QCSpecificationORM)
-                .values(
-                    program=qc_spec.program,
-                    driver=qc_spec.driver,
-                    method=qc_spec.method,
-                    basis=basis,
-                    keywords=qc_spec.keywords,
-                    keywords_hash=kw_hash,
-                    protocols=protocols_dict,
-                )
-                .on_conflict_do_nothing()
-                .returning(QCSpecificationORM.id)
+    def get(
+        self,
+        record_ids: Sequence[int],
+        include: Optional[Sequence[str]] = None,
+        exclude: Optional[Sequence[str]] = None,
+        missing_ok: bool = False,
+        *,
+        session: Optional[Session] = None,
+    ) -> List[Optional[Dict[str, Any]]]:
+        options = []
+        if include:
+            if is_included("molecule", include, exclude, False):
+                options.append(joinedload(SinglepointRecordORM.molecule))
+            if is_included("wavefunction", include, exclude, False):
+                options.append(joinedload(SinglepointRecordORM.wavefunction).undefer(WavefunctionORM.data))
+
+        with self.root_socket.optional_session(session, True) as session:
+            return self.root_socket.records.get_base(
+                orm_type=self.record_orm,
+                record_ids=record_ids,
+                include=include,
+                exclude=exclude,
+                missing_ok=missing_ok,
+                additional_options=options,
+                session=session,
             )
-
-            r = session.execute(stmt).scalar_one_or_none()
-            if r is not None:
-                return InsertMetadata(inserted_idx=[0]), r
-            else:
-                # Specification was already existing
-                stmt = select(QCSpecificationORM.id).filter_by(
-                    program=qc_spec.program,
-                    driver=qc_spec.driver,
-                    method=qc_spec.method,
-                    basis=basis,
-                    keywords_hash=kw_hash,
-                    protocols=protocols_dict,
-                )
-
-                r = session.execute(stmt).scalar_one()
-                return InsertMetadata(existing_idx=[0]), r
 
     def query(
         self,
@@ -207,23 +291,6 @@ class SinglepointRecordSocket(BaseRecordSocket):
         *,
         session: Optional[Session] = None,
     ) -> List[int]:
-        """
-        Query singlepoint records
-
-        Parameters
-        ----------
-        query_data
-            Fields/filters to query for
-        session
-            An existing SQLAlchemy session to use. If None, one will be created. If an existing session
-            is used, it will be flushed (but not committed) before returning from this function.
-
-        Returns
-        -------
-        :
-            A list of records that were found in the database.
-        """
-
         and_query = []
         need_join = False
 
@@ -242,8 +309,10 @@ class SinglepointRecordSocket(BaseRecordSocket):
         if query_data.molecule_id is not None:
             and_query.append(SinglepointRecordORM.molecule_id.in_(query_data.molecule_id))
         if query_data.keywords is not None:
-            keywords_hash = [hash_dict(d) for d in query_data.keywords]
-            and_query.append(QCSpecificationORM.keywords_hash.in_(keywords_hash))
+            or_query = []
+            for d in query_data.keywords:
+                or_query.append(QCSpecificationORM.keywords.comparator.contains(d))
+            and_query.append(or_(*or_query))
             need_join = True
 
         stmt = select(SinglepointRecordORM.id)

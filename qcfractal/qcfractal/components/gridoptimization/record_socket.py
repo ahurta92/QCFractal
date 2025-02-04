@@ -13,8 +13,7 @@ try:
 except ImportError:
     from pydantic import BaseModel, Extra, parse_obj_as
 from sqlalchemy import select, func
-from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.orm import lazyload, joinedload, undefer, defer
+from sqlalchemy.orm import lazyload, joinedload, selectinload, undefer, defer
 
 from qcfractal import __version__ as qcfractal_version
 from qcfractal.components.optimization.record_db_models import OptimizationSpecificationORM
@@ -34,7 +33,7 @@ from qcportal.metadata_models import InsertMetadata
 from qcportal.molecules import Molecule
 from qcportal.optimization import OptimizationSpecification
 from qcportal.record_models import PriorityEnum, RecordStatusEnum, OutputTypeEnum
-from qcportal.utils import hash_dict
+from qcportal.utils import hash_dict, is_included
 from .record_db_models import (
     GridoptimizationSpecificationORM,
     GridoptimizationOptimizationORM,
@@ -48,6 +47,7 @@ if TYPE_CHECKING:
 
 # Meaningless, but unique to gridoptimizations
 gridoptimization_insert_lock_id = 14300
+gridoptimization_spec_insert_lock_id = 14301
 
 
 def expand_ndimensional_grid(
@@ -410,6 +410,78 @@ class GridoptimizationRecordSocket(BaseRecordSocket):
             service_orm.dependencies.append(svc_dep)
             go_orm.optimizations.append(opt_assoc)
 
+    def add_specifications(
+        self, go_specs: Sequence[GridoptimizationSpecification], *, session: Optional[Session] = None
+    ) -> Tuple[InsertMetadata, List[int]]:
+        """
+        Adds specifications for gridoptimization services to the database, returning their IDs.
+
+        If an identical specification exists, then no insertion takes place and the id of the existing
+        specification is returned.
+
+        Specification IDs are returned in the same order as the input specifications
+
+        Parameters
+        ----------
+        go_specs
+            Sequence of specifications to add to the database
+        session
+            An existing SQLAlchemy session to use. If None, one will be created. If an existing session
+            is used, it will be flushed (but not committed) before returning from this function.
+
+        Returns
+        -------
+        :
+            Metadata about the insertion, and the IDs of the specifications.
+        """
+
+        to_add = []
+
+        for go_spec in go_specs:
+            go_kw_dict = go_spec.keywords.dict()
+
+            go_spec_dict = {"program": go_spec.program, "keywords": go_kw_dict, "protocols": {}}
+            go_spec_hash = hash_dict(go_spec_dict)
+
+            go_spec_orm = GridoptimizationSpecificationORM(
+                program=go_spec.program,
+                keywords=go_kw_dict,
+                protocols=go_spec_dict["protocols"],
+                specification_hash=go_spec_hash,
+            )
+
+            to_add.append(go_spec_orm)
+
+        with self.root_socket.optional_session(session, False) as session:
+
+            opt_specs = [x.optimization_specification for x in go_specs]
+            meta, opt_spec_ids = self.root_socket.records.optimization.add_specifications(opt_specs, session=session)
+
+            if not meta.success:
+                return (
+                    InsertMetadata(
+                        error_description="Unable to add optimization specifications: " + meta.error_string,
+                    ),
+                    [],
+                )
+
+            assert len(opt_spec_ids) == len(go_specs)
+            for go_spec_orm, opt_spec_id in zip(to_add, opt_spec_ids):
+                go_spec_orm.optimization_specification_id = opt_spec_id
+
+            meta, ids = insert_general(
+                session,
+                to_add,
+                (
+                    GridoptimizationSpecificationORM.specification_hash,
+                    GridoptimizationSpecificationORM.optimization_specification_id,
+                ),
+                (GridoptimizationSpecificationORM.id,),
+                gridoptimization_spec_insert_lock_id,
+            )
+
+            return meta, [x[0] for x in ids]
+
     def add_specification(
         self, go_spec: GridoptimizationSpecification, *, session: Optional[Session] = None
     ) -> Tuple[InsertMetadata, Optional[int]]:
@@ -433,47 +505,42 @@ class GridoptimizationRecordSocket(BaseRecordSocket):
             Metadata about the insertion, and the id of the specification.
         """
 
-        go_kw_dict = go_spec.keywords.dict()
-        kw_hash = hash_dict(go_kw_dict)
+        meta, ids = self.add_specifications([go_spec], session=session)
 
-        with self.root_socket.optional_session(session, False) as session:
-            # Add the optimization specification
-            meta, opt_spec_id = self.root_socket.records.optimization.add_specification(
-                go_spec.optimization_specification, session=session
+        if not ids:
+            return meta, None
+
+        return meta, ids[0]
+
+    def get(
+        self,
+        record_ids: Sequence[int],
+        include: Optional[Sequence[str]] = None,
+        exclude: Optional[Sequence[str]] = None,
+        missing_ok: bool = False,
+        *,
+        session: Optional[Session] = None,
+    ) -> List[Optional[Dict[str, Any]]]:
+        options = []
+
+        if include:
+            if is_included("initial_molecule", include, exclude, False):
+                options.append(joinedload(GridoptimizationRecordORM.initial_molecule))
+            if is_included("starting_molecule", include, exclude, False):
+                options.append(joinedload(GridoptimizationRecordORM.starting_molecule))
+            if is_included("optimizations", include, exclude, False):
+                options.append(selectinload(GridoptimizationRecordORM.optimizations))
+
+        with self.root_socket.optional_session(session, True) as session:
+            return self.root_socket.records.get_base(
+                orm_type=self.record_orm,
+                record_ids=record_ids,
+                include=include,
+                exclude=exclude,
+                missing_ok=missing_ok,
+                additional_options=options,
+                session=session,
             )
-            if not meta.success:
-                return (
-                    InsertMetadata(
-                        error_description="Unable to add optimization specification: " + meta.error_string,
-                    ),
-                    None,
-                )
-
-            stmt = (
-                insert(GridoptimizationSpecificationORM)
-                .values(
-                    program=go_spec.program,
-                    keywords=go_kw_dict,
-                    keywords_hash=kw_hash,
-                    optimization_specification_id=opt_spec_id,
-                )
-                .on_conflict_do_nothing()
-                .returning(GridoptimizationSpecificationORM.id)
-            )
-
-            r = session.execute(stmt).scalar_one_or_none()
-            if r is not None:
-                return InsertMetadata(inserted_idx=[0]), r
-            else:
-                # Specification was already existing
-                stmt = select(GridoptimizationSpecificationORM.id).filter_by(
-                    program=go_spec.program,
-                    keywords_hash=kw_hash,
-                    optimization_specification_id=opt_spec_id,
-                )
-
-                r = session.execute(stmt).scalar_one()
-                return InsertMetadata(existing_idx=[0]), r
 
     def query(
         self,
@@ -481,23 +548,6 @@ class GridoptimizationRecordSocket(BaseRecordSocket):
         *,
         session: Optional[Session] = None,
     ) -> List[int]:
-        """
-        Query gridoptimization records
-
-        Parameters
-        ----------
-        query_data
-            Fields/filters to query for
-        session
-            An existing SQLAlchemy session to use. If None, one will be created. If an existing session
-            is used, it will be flushed (but not committed) before returning from this function.
-
-        Returns
-        -------
-        :
-            A list of record ids that were found in the database.
-        """
-
         and_query = []
         need_spspec_join = False
         need_optspec_join = False

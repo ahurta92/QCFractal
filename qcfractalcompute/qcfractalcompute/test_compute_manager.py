@@ -84,6 +84,56 @@ def test_manager_tags(snowflake: QCATestingSnowflake, tmp_path):
     assert set(managers[0]["tags"]) == {"tag1", "tag2", "tag3", "tag4", "*"}
 
 
+def test_manager_tags_missing(snowflake: QCATestingSnowflake, tmp_path):
+    compute_config = FractalComputeConfig(
+        base_folder=str(tmp_path),
+        cluster="testing_compute",
+        update_frequency=5,
+        server=FractalServerSettings(
+            fractal_uri=snowflake.get_uri(),
+            verify=False,
+        ),
+        executors={
+            "local": LocalExecutorConfig(
+                cores_per_worker=1,
+                memory_per_worker=1,
+                max_workers=1,
+                queue_tags=["tag1", "tag2", "*"],
+            ),
+            "local2": LocalExecutorConfig(cores_per_worker=1, memory_per_worker=1, max_workers=1, queue_tags=[]),
+        },
+    )
+
+    with pytest.raises(ValueError, match="local2 has no queue tags"):
+        ComputeManager(compute_config)
+
+
+def test_manager_tags_duplicate(snowflake: QCATestingSnowflake, tmp_path):
+    compute_config = FractalComputeConfig(
+        base_folder=str(tmp_path),
+        cluster="testing_compute",
+        update_frequency=5,
+        server=FractalServerSettings(
+            fractal_uri=snowflake.get_uri(),
+            verify=False,
+        ),
+        executors={
+            "local": LocalExecutorConfig(
+                cores_per_worker=1,
+                memory_per_worker=1,
+                max_workers=1,
+                queue_tags=["tag1", "tag2", "*"],
+            ),
+            "local2": LocalExecutorConfig(
+                cores_per_worker=1, memory_per_worker=1, max_workers=1, queue_tags=["tag2", "tag1"]
+            ),
+        },
+    )
+
+    compute = ComputeManager(compute_config)
+    assert compute.all_queue_tags == ["tag1", "tag2", "*"]
+
+
 @pytest.mark.filterwarnings("ignore:Exception in thread")
 def test_manager_claim_inactive(snowflake: QCATestingSnowflake):
     storage_socket = snowflake.get_storage_socket()
@@ -176,13 +226,51 @@ def test_manager_missed_heartbeats_shutdown(snowflake: QCATestingSnowflake):
 
     snowflake.stop_api()
 
-    for i in range(60):
+    for i in range(90):
         time.sleep(1)
 
         if not compute_thread.is_alive():
             break
     else:
-        raise RuntimeError("Compute thread did not stop in 60 seconds")
+        raise RuntimeError("Compute thread did not stop in 90 seconds")
+
+    compute_thread._compute_thread.join(5)
+    assert compute_thread.is_alive() is False
+
+
+def test_manager_idle_shutdown_0(snowflake: QCATestingSnowflake):
+    add_config = {"max_idle_time": 0}
+    compute_thread = QCATestingComputeThread(snowflake._qcf_config, additional_manager_config=add_config)
+    compute_thread.start(manual_updates=False)
+
+    for i in range(10):
+        time.sleep(1)
+        if not compute_thread.is_alive():
+            break
+    else:
+        raise RuntimeError("Compute thread did not stop in 10 seconds")
+
+    compute_thread._compute_thread.join(5)
+    assert compute_thread.is_alive() is False
+
+
+def test_manager_idle_shutdown_5(snowflake: QCATestingSnowflake):
+    storage_socket = snowflake.get_storage_socket()
+
+    add_config = {"max_idle_time": 5}
+    compute_thread = QCATestingComputeThread(snowflake._qcf_config, additional_manager_config=add_config)
+    compute_thread.start(manual_updates=False)
+
+    time.sleep(2)
+    assert compute_thread.is_alive()
+
+    populate_db(storage_socket)
+
+    time.sleep(9)
+    assert compute_thread.is_alive()
+
+    time.sleep(10)
+    assert not compute_thread.is_alive()
 
     compute_thread._compute_thread.join(5)
     assert compute_thread.is_alive() is False

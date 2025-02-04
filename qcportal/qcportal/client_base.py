@@ -20,7 +20,9 @@ try:
 except ImportError:
     import pydantic
 import requests
+from typing import Tuple
 import yaml
+import hashlib
 from packaging.version import parse as parse_version
 
 from . import __version__
@@ -73,6 +75,8 @@ class PortalClientBase:
         password: Optional[str] = None,
         verify: bool = True,
         show_motd: bool = True,
+        *,
+        information_endpoint: str = "api/v1/information",
     ) -> None:
         """Initializes a PortalClient instance from an address and verification information.
 
@@ -96,6 +100,9 @@ class PortalClientBase:
 
         # For developer use and debugging
         self.debug_requests = False
+
+        # Where we get the server information from
+        self._information_endpoint = information_endpoint.strip("/")
 
         if not address.startswith("http://") and not address.startswith("https://"):
             address = "https://" + address
@@ -127,6 +134,14 @@ class PortalClientBase:
         self.retry_delay = 0.5
         self.retry_backoff = 2
         self.retry_jitter_fraction = 0.05
+
+        # Processing/downloading in threads
+        # Number of threads to use when fetching from the server
+        self.n_download_threads = 2
+
+        # Target time for how long a request should take (in seconds)
+        # Chunk size will be adjusted to try to reach this target time
+        self.download_target_time = 0.50
 
         # If no 3rd party verification, quiet urllib
         if self._verify is False:
@@ -220,6 +235,43 @@ class PortalClientBase:
 
         return cls(**data)
 
+    @classmethod
+    def from_env(cls):
+        """Creates a new client given information stored in environment variables
+
+        The environment variables are:
+
+          * QCPORTAL_ADDRESS (required)
+          * QCPORTAL_USERNAME (optional)
+          * QCPORTAL_PASSWORD (optional)
+          * QCPORTAL_VERIFY (optional, defaults to True)
+          * QCPORTAL_CACHE_DIR (optional)
+        """
+
+        address = os.environ.get("QCPORTAL_ADDRESS", None)
+        username = os.environ.get("QCPORTAL_USERNAME", None)
+        password = os.environ.get("QCPORTAL_PASSWORD", None)
+        verify = os.environ.get("QCPORTAL_VERIFY", True)
+        cache_dir = os.environ.get("QCPORTAL_CACHE_DIR", None)
+
+        if address is None:
+            raise KeyError("Required environment variable 'QCPORTAL_ADDRESS' not found")
+
+        data = {"address": address}
+
+        if username is not None:
+            data["username"] = username
+
+        if password is not None:
+            data["password"] = password
+
+        if cache_dir is not None:
+            data["cache_dir"] = cache_dir
+
+        data["verify"] = verify
+
+        return cls(**data)
+
     @property
     def encoding(self) -> str:
         return self._encoding
@@ -230,17 +282,83 @@ class PortalClientBase:
         enc_headers = {"Content-Type": encoding, "Accept": encoding}
         self._req_session.headers.update(enc_headers)
 
-    def _get_JWT_token(self) -> None:
+    def _send_request(self, req: requests.Request, allow_retries: bool = True) -> requests.Response:
+        """
+        Sends a prepared request, optionally retrying on errors
+
+        Parameters
+        ----------
+        req
+            A prepared request to send
+        allow_retries
+            If true, attempts to retry on certain kinds of errors
+
+        Returns
+        -------
+        :
+            The response returned from the request
+        """
+
+        prep_req = self._req_session.prepare_request(req)
+
+        if self.debug_requests:
+            pretty_print_request(prep_req)
+
+        if not allow_retries:
+            ret = self._req_session.send(prep_req, verify=self._verify, timeout=self.timeout, allow_redirects=False)
+
+            if self.debug_requests:
+                pretty_print_response(ret)
+
+            if ret.is_redirect:
+                raise RuntimeError("Redirection is not allowed")
+            return ret
+
+        retry_count = 0
+
         try:
-            ret = self._req_session.post(
-                self.address + "auth/v1/login",
-                json={"username": self._username, "password": self._password},
-                verify=self._verify,
-            )
+            while True:
+                try:
+                    ret = self._req_session.send(
+                        prep_req, verify=self._verify, timeout=self.timeout, allow_redirects=False
+                    )
+                    break
+                except requests.exceptions.SSLError:
+                    raise ConnectionRefusedError(_ssl_error_msg) from None
+                except (requests.exceptions.ConnectionError, requests.exceptions.ConnectTimeout) as e:
+                    if retry_count >= self.retry_max:
+                        raise
+
+                    # eg, if jitter fraction is 0.05, then multiply by something on the range 0.95 to 1.05
+                    jitter = random.uniform(1.0 - self.retry_jitter_fraction, 1.0 + self.retry_jitter_fraction)
+                    time_to_wait = self.retry_delay * (self.retry_backoff**retry_count) * jitter
+
+                    retry_count += 1
+                    self._logger.warning(
+                        f"Connection error for {prep_req.url}: {str(e)} - retrying in {time_to_wait:.2f} seconds "
+                        f"[{retry_count}/{self.retry_max}]"
+                    )
+                    time.sleep(time_to_wait)
         except requests.exceptions.SSLError:
             raise ConnectionRefusedError(_ssl_error_msg) from None
         except requests.exceptions.ConnectionError:
             raise ConnectionRefusedError(_connection_error_msg.format(self.address)) from None
+
+        if self.debug_requests:
+            pretty_print_response(ret)
+
+        if ret.is_redirect:
+            raise RuntimeError("Redirection is not allowed")
+
+        return ret
+
+    def _get_JWT_token(self) -> None:
+
+        full_uri = self.address + "auth/v1/login"
+        json = {"username": self._username, "password": self._password}
+
+        req = requests.Request(method="POST", url=full_uri, json=json)
+        ret = self._send_request(req)
 
         if ret.status_code == 200:
             ret_json = ret.json()
@@ -266,11 +384,12 @@ class PortalClientBase:
             raise AuthenticationFailure(msg)
 
     def _refresh_JWT_token(self) -> None:
-        ret = self._req_session.post(
-            self.address + "auth/v1/refresh",
-            headers={"Authorization": f"Bearer {self._jwt_refresh_token}"},
-            verify=self._verify,
-        )
+
+        full_uri = self.address + "auth/v1/refresh"
+        headers = {"Authorization": f"Bearer {self._jwt_refresh_token}"}
+
+        req = requests.Request(method="POST", url=full_uri, headers=headers)
+        ret = self._send_request(req)
 
         if ret.status_code == 200:
             ret_json = ret.json()
@@ -304,6 +423,7 @@ class PortalClientBase:
         url_params: Optional[Dict[str, Any]] = None,
         internal_retry: Optional[bool] = True,
         allow_retries: bool = True,
+        additional_headers: Optional[Dict[str, Any]] = None,
     ) -> requests.Response:
         # If refresh token has expired, log in again
         if self._jwt_refresh_exp and self._jwt_refresh_exp < time.time():
@@ -314,44 +434,10 @@ class PortalClientBase:
             self._refresh_JWT_token()
 
         full_uri = self.address + endpoint
-
-        req = requests.Request(method=method.upper(), url=full_uri, data=body, params=url_params)
-        prep_req = self._req_session.prepare_request(req)
-
-        if self.debug_requests:
-            pretty_print_request(prep_req)
-
-        try:
-            if not allow_retries:
-                r = self._req_session.send(prep_req, verify=self._verify, timeout=self.timeout)
-            else:
-                current_retries = 0
-                while True:
-                    try:
-                        r = self._req_session.send(prep_req, verify=self._verify, timeout=self.timeout)
-                        break
-                    except (requests.exceptions.ConnectionError, requests.exceptions.ConnectTimeout) as e:
-                        if current_retries >= self.retry_max:
-                            raise
-
-                        # eg, if jitter fraction is 0.05, then multiply by something on the range 0.95 to 1.05
-                        jitter = random.uniform(1.0 - self.retry_jitter_fraction, 1.0 + self.retry_jitter_fraction)
-                        time_to_wait = self.retry_delay * (self.retry_backoff**current_retries) * jitter
-
-                        current_retries += 1
-                        self._logger.warning(
-                            f"Connection failed: {str(e)} - retrying in {time_to_wait:.2f} seconds "
-                            f"[{current_retries}/{self.retry_max}]"
-                        )
-                        time.sleep(time_to_wait)
-
-            if self.debug_requests:
-                pretty_print_response(r)
-
-        except requests.exceptions.SSLError:
-            raise ConnectionRefusedError(_ssl_error_msg) from None
-        except requests.exceptions.ConnectionError:
-            raise ConnectionRefusedError(_connection_error_msg.format(self.address)) from None
+        req = requests.Request(
+            method=method.upper(), url=full_uri, data=body, params=url_params, headers=additional_headers
+        )
+        r = self._send_request(req, allow_retries=allow_retries)
 
         # If JWT token expired, automatically renew it and retry once. This should have been caught above,
         # but can happen in rare instances where the token expires between the time we check it and the time
@@ -385,6 +471,7 @@ class PortalClientBase:
         body: Optional[Union[_T, Dict[str, Any]]] = None,
         url_params: Optional[Union[_U, Dict[str, Any]]] = None,
         allow_retries: bool = True,
+        additional_headers: Optional[Dict[str, Any]] = None,
     ) -> _V:
         # If body_model or url_params_model are None, then use the type given
         if body_model is None and body is not None:
@@ -406,7 +493,12 @@ class PortalClientBase:
             parsed_url_params = parsed_url_params.dict()
 
         r = self._request(
-            method, endpoint, body=serialized_body, url_params=parsed_url_params, allow_retries=allow_retries
+            method,
+            endpoint,
+            body=serialized_body,
+            url_params=parsed_url_params,
+            allow_retries=allow_retries,
+            additional_headers=additional_headers,
         )
         d = deserialize(r.content, r.headers["Content-Type"])
 
@@ -414,6 +506,38 @@ class PortalClientBase:
             return None
         else:
             return pydantic.parse_obj_as(response_model, d)
+
+    def download_file(self, endpoint: str, destination_path: str, overwrite: bool = False) -> Tuple[int, str]:
+
+        sha256 = hashlib.sha256()
+        file_size = 0
+
+        # Remove if overwrite=True. This allows for any processes still using the old file to keep using it
+        # (at least on linux)
+        if os.path.exists(destination_path):
+            if overwrite:
+                os.remove(destination_path)
+            else:
+                raise RuntimeError(f"File already exists at {destination_path}. To overwrite, use `overwrite=True`")
+
+        full_uri = self.address + endpoint
+        response = self._req_session.get(full_uri, stream=True, allow_redirects=False)
+
+        if response.is_redirect:
+            # send again, but using a plain requests object
+            # that way, we don't pass the JWT to someone else
+            new_location = response.headers["Location"]
+            response = requests.get(new_location, stream=True, allow_redirects=True)
+
+        response.raise_for_status()
+        with open(destination_path, "wb") as f:
+            for chunk in response.iter_content(chunk_size=None):
+                if chunk:
+                    f.write(chunk)
+                    sha256.update(chunk)
+                    file_size += len(chunk)
+
+        return file_size, sha256.hexdigest()
 
     def ping(self) -> bool:
         """
@@ -443,4 +567,8 @@ class PortalClientBase:
         """
 
         # Request the info, and store here for later use
-        return self.make_request("get", "api/v1/information", Dict[str, Any])
+        # TODO - this fallback is temporary - remove in a future version
+        try:
+            return self.make_request("get", self._information_endpoint, Dict[str, Any])
+        except PortalRequestError as e:
+            return self.make_request("get", "api/v1/information", Dict[str, Any])

@@ -15,8 +15,8 @@ except ImportError:
     from pydantic import BaseModel, Extra
 
 from sqlalchemy import select, func
-from sqlalchemy.dialects.postgresql import insert, array_agg, aggregate_order_by, DOUBLE_PRECISION, TEXT
-from sqlalchemy.orm import lazyload, joinedload, defer, undefer
+from sqlalchemy.dialects.postgresql import array_agg, aggregate_order_by, DOUBLE_PRECISION, TEXT
+from sqlalchemy.orm import lazyload, joinedload, selectinload, defer, undefer
 
 from qcfractal.components.molecules.db_models import MoleculeORM
 from qcfractal.components.services.db_models import ServiceQueueORM, ServiceDependencyORM
@@ -32,8 +32,7 @@ from qcportal.optimization import OptimizationSpecification
 from qcportal.record_models import PriorityEnum, RecordStatusEnum, OutputTypeEnum
 from qcportal.serialization import convert_numpy_recursive
 from qcportal.singlepoint import QCSpecification
-from qcportal.utils import capture_all_output
-from qcportal.utils import hash_dict
+from qcportal.utils import capture_all_output, hash_dict, is_included
 from .record_db_models import (
     NEBOptimizationsORM,
     NEBSpecificationORM,
@@ -53,7 +52,7 @@ if _geo_spec is not None:
 if TYPE_CHECKING:
     from sqlalchemy.orm.session import Session
     from qcfractal.db_socket.socket import SQLAlchemySocket
-    from typing import List, Dict, Tuple, Optional, Sequence, Any, Union, Iterable
+    from typing import List, Dict, Tuple, Optional, Sequence, Any, Union
 
 # Meaningless, but unique to neb
 neb_insert_lock_id = 14600
@@ -202,7 +201,7 @@ class NEBRecordSocket(BaseRecordSocket):
                     initial_molecules[-1] = complete_opts[-1].record.final_molecule.to_model(Molecule)
 
                 with capture_all_output("geometric.nifty") as (rdout, _):
-                    respaced_chain = geometric.qcf_neb.arrange(initial_molecules)
+                    respaced_chain = geometric.qcf_neb.arrange(initial_molecules, params.get("align"))
 
                 output += "\n" + rdout.getvalue()
 
@@ -301,7 +300,7 @@ class NEBRecordSocket(BaseRecordSocket):
                 else:
                     # Hessian completed, do optimization
                     complete_sp = service_orm.dependencies[0]
-                    service_orm.service_state["tshessian"] = complete_sp.record.properties["return_hessian"]
+                    service_orm.service_state["tshessian"] = complete_sp.record.properties["return_result"]
                     self.submit_optimizations(session, service_orm, [Molecule(**TS_mol.model_dict())])
                     service_state.tsoptimize = False
 
@@ -459,87 +458,21 @@ class NEBRecordSocket(BaseRecordSocket):
 
         service_orm.dependencies.append(svc_dep)
 
-    def add_specification(
-        self, neb_spec: NEBSpecification, *, session: Optional[Session] = None
-    ) -> Tuple[InsertMetadata, Optional[int]]:
-        neb_kw_dict = neb_spec.keywords.dict()
-        kw_hash = hash_dict(neb_kw_dict)
-
-        with self.root_socket.optional_session(session, False) as session:
-            # Add the singlepoint specification
-            meta, sp_spec_id = self.root_socket.records.singlepoint.add_specification(
-                neb_spec.singlepoint_specification, session=session
-            )
-            if not meta.success:
-                return (
-                    InsertMetadata(
-                        error_description="Unable to add singlepoint specification: " + meta.error_string,
-                    ),
-                    None,
-                )
-            # Add the optimization specification
-            opt_spec_id = None
-            if neb_spec.optimization_specification is not None:
-                meta, opt_spec_id = self.root_socket.records.optimization.add_specification(
-                    neb_spec.optimization_specification, session=session
-                )
-                if not meta.success:
-                    return (
-                        InsertMetadata(
-                            error_description="Unable to add optimization specification: " + meta.error_string,
-                        ),
-                        None,
-                    )
-
-            # Lock for the rest of the transaction (since we have to query then add)
-            session.execute(select(func.pg_advisory_xact_lock(neb_spec_insert_lock_id))).scalar()
-
-            stmt = select(NEBSpecificationORM.id).filter_by(
-                program=neb_spec.program,
-                keywords_hash=kw_hash,
-                singlepoint_specification_id=sp_spec_id,
-                optimization_specification_id=opt_spec_id,
-            )
-
-            if opt_spec_id is not None:
-                stmt = stmt.filter(NEBSpecificationORM.optimization_specification_id == opt_spec_id)
-            else:
-                stmt = stmt.filter(NEBSpecificationORM.optimization_specification_id.is_(None))
-
-            r = session.execute(stmt).scalar_one_or_none()
-
-            if r is not None:
-                return InsertMetadata(existing_idx=[0]), r
-            else:
-                # Specification did not already exist
-                stmt = (
-                    insert(NEBSpecificationORM)
-                    .values(
-                        program=neb_spec.program,
-                        keywords=neb_kw_dict,
-                        keywords_hash=kw_hash,
-                        singlepoint_specification_id=sp_spec_id,
-                        optimization_specification_id=opt_spec_id,
-                    )
-                    .returning(NEBSpecificationORM.id)
-                )
-
-                r = session.execute(stmt).scalar_one()
-                return InsertMetadata(inserted_idx=[0]), r
-
-    def query(
-        self,
-        query_data: NEBQueryFilters,
-        *,
-        session: Optional[Session] = None,
-    ) -> List[int]:
+    def add_specifications(
+        self, neb_specs: Sequence[NEBSpecification], *, session: Optional[Session] = None
+    ) -> Tuple[InsertMetadata, List[int]]:
         """
-        Query neb records
+        Adds specifications for NEB services to the database, returning their IDs.
+
+        If an identical specification exists, then no insertion takes place and the id of the existing
+        specification is returned.
+
+        Specification IDs are returned in the same order as the input specifications
 
         Parameters
         ----------
-        query_data
-            Fields/filters to query for
+        neb_specs
+            Sequence of specifications to add to the database
         session
             An existing SQLAlchemy session to use. If None, one will be created. If an existing session
             is used, it will be flushed (but not committed) before returning from this function.
@@ -547,9 +480,169 @@ class NEBRecordSocket(BaseRecordSocket):
         Returns
         -------
         :
-            A list of record ids that were found in the database.
+            Metadata about the insertion, and the IDs of the specifications.
         """
 
+        to_add = []
+
+        for neb_spec in neb_specs:
+            kw_dict = neb_spec.keywords.dict()
+
+            neb_spec_dict = {"program": neb_spec.program, "keywords": kw_dict, "protocols": {}}
+            neb_spec_hash = hash_dict(neb_spec_dict)
+
+            neb_spec_orm = NEBSpecificationORM(
+                program=neb_spec.program,
+                keywords=kw_dict,
+                protocols=neb_spec_dict["protocols"],
+                specification_hash=neb_spec_hash,
+            )
+
+            to_add.append(neb_spec_orm)
+
+        with self.root_socket.optional_session(session, False) as session:
+
+            qc_specs = [x.singlepoint_specification for x in neb_specs]
+            meta, qc_spec_ids = self.root_socket.records.singlepoint.add_specifications(qc_specs, session=session)
+
+            if not meta.success:
+                return (
+                    InsertMetadata(
+                        error_description="Unable to add singlepoint specifications: " + meta.error_string,
+                    ),
+                    [],
+                )
+
+            opt_specs_lst = [
+                (idx, x.optimization_specification)
+                for idx, x in enumerate(neb_specs)
+                if x.optimization_specification is not None
+            ]
+
+            opt_specs_map = {}
+
+            if opt_specs_lst:
+                opt_specs = [x[1] for x in opt_specs_lst]
+                meta, opt_spec_ids = self.root_socket.records.optimization.add_specifications(
+                    opt_specs, session=session
+                )
+
+                if not meta.success:
+                    return (
+                        InsertMetadata(
+                            error_description="Unable to add optimization specifications: " + meta.error_string,
+                        ),
+                        [],
+                    )
+
+                opt_specs_map = {idx: opt_spec_id for (idx, _), opt_spec_id in zip(opt_specs_lst, opt_spec_ids)}
+
+            # Unfortunately, we have to go one at a time due to the possibility of NULL fields
+            # Lock for the rest of the transaction (since we have to query then add)
+            session.execute(select(func.pg_advisory_xact_lock(neb_spec_insert_lock_id))).scalar()
+
+            inserted_idx = []
+            existing_idx = []
+            neb_spec_ids = []
+
+            for idx, neb_spec_orm in enumerate(to_add):
+                opt_spec_id = opt_specs_map.get(idx, None)
+
+                # QC Spec is always there
+                neb_spec_orm.singlepoint_specification_id = qc_spec_ids[idx]
+                neb_spec_orm.optimization_specification_id = None
+
+                # Query first, due to behavior of NULL in postgres
+                stmt = select(NEBSpecificationORM.id).filter_by(
+                    specification_hash=neb_spec_orm.specification_hash,
+                    singlepoint_specification_id=neb_spec_orm.singlepoint_specification_id,
+                )
+
+                if opt_spec_id is not None:
+                    neb_spec_orm.optimization_specification_id = opt_spec_id
+                    stmt = stmt.filter(NEBSpecificationORM.optimization_specification_id == opt_spec_id)
+                else:
+                    stmt = stmt.filter(NEBSpecificationORM.optimization_specification_id.is_(None))
+
+                r = session.execute(stmt).scalar_one_or_none()
+
+                if r is not None:
+                    neb_spec_ids.append(r)
+                    existing_idx.append(idx)
+                else:
+                    session.add(neb_spec_orm)
+                    session.flush()
+                    neb_spec_ids.append(neb_spec_orm.id)
+                    inserted_idx.append(idx)
+
+            return InsertMetadata(inserted_idx=inserted_idx, existing_idx=existing_idx), neb_spec_ids
+
+    def add_specification(
+        self, neb_spec: NEBSpecification, *, session: Optional[Session] = None
+    ) -> Tuple[InsertMetadata, Optional[int]]:
+        """
+        Adds a specification for an NEB service to the database, returning its id.
+
+        If an identical specification exists, then no insertion takes place and the id of the existing
+        specification is returned.
+
+        Parameters
+        ----------
+        neb_spec
+            Specification to add to the database
+        session
+            An existing SQLAlchemy session to use. If None, one will be created. If an existing session
+            is used, it will be flushed (but not committed) before returning from this function.
+
+        Returns
+        -------
+        :
+            Metadata about the insertion, and the id of the specification.
+        """
+
+        meta, ids = self.add_specifications([neb_spec], session=session)
+
+        if not ids:
+            return meta, None
+
+        return meta, ids[0]
+
+    def get(
+        self,
+        record_ids: Sequence[int],
+        include: Optional[Sequence[str]] = None,
+        exclude: Optional[Sequence[str]] = None,
+        missing_ok: bool = False,
+        *,
+        session: Optional[Session] = None,
+    ) -> List[Optional[Dict[str, Any]]]:
+        options = []
+
+        if include:
+            if is_included("initial_chain", include, exclude, False):
+                options.append(selectinload(NEBRecordORM.initial_chain).joinedload(NEBInitialchainORM.molecule))
+            if is_included("singlepoints", include, exclude, False):
+                options.append(selectinload(NEBRecordORM.singlepoints))
+            if is_included("optimizations", include, exclude, False):
+                options.append(selectinload(NEBRecordORM.optimizations))
+
+        with self.root_socket.optional_session(session, True) as session:
+            return self.root_socket.records.get_base(
+                orm_type=self.record_orm,
+                record_ids=record_ids,
+                include=include,
+                exclude=exclude,
+                missing_ok=missing_ok,
+                additional_options=options,
+                session=session,
+            )
+
+    def query(
+        self,
+        query_data: NEBQueryFilters,
+        *,
+        session: Optional[Session] = None,
+    ) -> List[int]:
         and_query = []
         need_spspec_join = False
         need_initchain_join = False
@@ -873,17 +966,7 @@ class NEBRecordSocket(BaseRecordSocket):
             if rec is None:
                 raise MissingDataError(f"Cannot find record {record_id}")
 
-            ret = {}
-
-            for opt in rec.optimizations:
-                if opt.ts:
-                    ret["transition"] = opt.model_dict()
-                elif opt.position == 0:
-                    ret["initial"] = opt.model_dict()
-                else:
-                    ret["final"] = opt.model_dict()
-
-            return ret
+            return rec.model_dict()["optimizations"]
 
     def get_neb_result(
         self,

@@ -1,6 +1,6 @@
 import base64
 import json
-from typing import Union, Any
+from typing import Union, Any, Optional
 
 import msgpack
 import numpy as np
@@ -16,7 +16,7 @@ except ImportError:
 def _msgpack_encode(obj: Any) -> Any:
     if isinstance(obj, BaseModel):
         # Don't include unset fields in pydantic models
-        return obj.dict(exclude_unset=True)
+        return obj.dict(exclude_unset=True, by_alias=True)
 
     try:
         return pydantic_encoder(obj)
@@ -36,6 +36,42 @@ def _msgpack_decode(obj: Any) -> Any:
     return obj
 
 
+def encode_to_json(obj: Any, encoder: Optional[json.JSONEncoder] = None) -> Any:
+    """
+    Takes an object and turns it into plain python that can be encoded to JSON.
+
+    This does not actually turn the object into JSON (string), just prepares it to be done.
+    This is useful for turning various objects into something that can be put into a JSON(B) column
+    in the database
+    """
+    # JSON does not handle byte arrays
+    # So convert to base64
+    if isinstance(obj, bytes):
+        return {"_bytes_base64_": base64.b64encode(obj).decode("ascii")}
+
+    # Now do anything with pydantic, excluding unset fields
+    # Also always use aliases when serializing
+    if isinstance(obj, BaseModel):
+        return obj.dict(exclude_unset=True, by_alias=True)
+
+    # Let pydantic handle other things
+    try:
+        return pydantic_encoder(obj)
+    except TypeError:
+        pass
+
+    # Flatten numpy arrays
+    # This is mostly for Molecule class
+    # TODO - remove once all data in the database in converted
+    if isinstance(obj, np.ndarray):
+        if obj.shape:
+            return obj.ravel().tolist()
+        else:
+            return obj.tolist()
+
+    return obj
+
+
 class _JSONEncoder(json.JSONEncoder):
     def default(self, obj: Any) -> Any:
         # JSON does not handle byte arrays
@@ -44,8 +80,9 @@ class _JSONEncoder(json.JSONEncoder):
             return {"_bytes_base64_": base64.b64encode(obj).decode("ascii")}
 
         # Now do anything with pydantic, excluding unset fields
+        # Also always use aliases when serializing
         if isinstance(obj, BaseModel):
-            return obj.dict(exclude_unset=True)
+            return obj.dict(exclude_unset=True, by_alias=True)
 
         # Let pydantic handle other things
         try:
@@ -78,7 +115,7 @@ def deserialize(data: Union[bytes, str], content_type: str):
         content_type = content_type[12:]
 
     if content_type == "msgpack":
-        return msgpack.loads(data, object_hook=_msgpack_decode, raw=False)
+        return msgpack.loads(data, object_hook=_msgpack_decode, raw=False, strict_map_key=False)
     elif content_type == "json":
         # JSON stored as bytes? Decode into a string for json to load
         if isinstance(data, bytes):

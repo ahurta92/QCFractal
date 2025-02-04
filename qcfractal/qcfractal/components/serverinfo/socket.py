@@ -11,30 +11,23 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
 import requests
-from sqlalchemy import and_, or_, func, text, select, delete
+from sqlalchemy import and_, or_, func, select, delete
 from sqlalchemy.orm import load_only
 
 import qcfractal
 from qcfractal.components.auth.db_models import UserIDMapSubquery
-from qcfractal.components.dataset_db_models import BaseDatasetORM
-from qcfractal.components.molecules.db_models import MoleculeORM
-from qcfractal.components.record_db_models import BaseRecordORM, OutputStoreORM
-from qcfractal.components.services.db_models import ServiceQueueORM
-from qcfractal.components.tasks.db_models import TaskQueueORM
 from qcfractal.db_socket.helpers import get_query_proj_options
 from qcportal.serverinfo import (
     AccessLogQueryFilters,
     AccessLogSummaryFilters,
     ErrorLogQueryFilters,
-    ServerStatsQueryFilters,
 )
 from qcportal.utils import now_at_utc
-from .db_models import AccessLogORM, InternalErrorLogORM, ServerStatsLogORM, MessageOfTheDayORM, ServerStatsMetadataORM
+from .db_models import AccessLogORM, InternalErrorLogORM, MessageOfTheDayORM, ServerStatsMetadataORM
 
 if TYPE_CHECKING:
     from sqlalchemy.orm.session import Session
     from qcfractal.db_socket.socket import SQLAlchemySocket
-    from qcfractal.components.internal_jobs.status import JobProgress
     from typing import Dict, Any, List, Optional
 
 # GeoIP2 package is optional
@@ -54,7 +47,6 @@ class ServerInfoSocket:
     def __init__(self, root_socket: SQLAlchemySocket):
         self.root_socket = root_socket
         self._logger = logging.getLogger(__name__)
-        self._server_stats_frequency = root_socket.qcf_config.statistics_frequency
 
         self._geoip2_dir = root_socket.qcf_config.geoip2_dir
         self._geoip2_file_path = os.path.join(self._geoip2_dir, root_socket.qcf_config.geoip2_filename)
@@ -65,6 +57,8 @@ class ServerInfoSocket:
 
         # Set up access logging
         self._access_log_enabled = root_socket.qcf_config.log_access
+        self._delete_access_log_frequency = 60 * 60 * 24  # one day
+        self._access_log_keep = root_socket.qcf_config.access_log_keep
         self._geoip2_enabled = geoip2_found and self._access_log_enabled
 
         # MOTD contents
@@ -79,84 +73,52 @@ class ServerInfoSocket:
                     "GeoIP2 package not found. To include locations in access logs, install the geoip2 package"
                 )
 
-        # Server stats job. Don't do it right at startup
-        self.add_internal_job_server_stats(self._server_stats_frequency)
+        ################################
+        # Add various internal jobs
+        ################################
+        with self.root_socket.session_scope() as session:
+            # updating geoip2 file
+            # Only add this if we have the maxmind license key
+            if self._geoip2_enabled and self._maxmind_license_key:
+                with self.root_socket.optional_session(session) as session:
+                    self.root_socket.internal_jobs.add(
+                        "update_geoip2_file",
+                        now_at_utc(),
+                        "serverinfo.update_geoip2_file",
+                        {},
+                        user_id=None,
+                        unique_name=True,
+                        repeat_delay=self._update_geoip2_frequency,
+                        session=session,
+                    )
 
-        # Updating the geolocation database file
-        self.add_internal_job_update_geoip2(0.0)
+            # Doing processing of access log
+            if self._geoip2_enabled:
+                self.root_socket.internal_jobs.add(
+                    "geolocate_accesses",
+                    now_at_utc(),
+                    "serverinfo.geolocate_accesses",
+                    {},
+                    user_id=None,
+                    unique_name=True,
+                    repeat_delay=self._geolocate_accesses_frequency,
+                    session=session,
+                )
 
-        # Updating the access log with geolocation info. Don't do it right at startup
-        self.add_internal_job_geolocate_accesses(self._geolocate_accesses_frequency)
+            # Deleting old access logs
+            if self._access_log_keep > 0 and self._access_log_enabled:
+                self.root_socket.internal_jobs.add(
+                    "delete_old_access_log",
+                    now_at_utc() + timedelta(seconds=2.0),
+                    "serverinfo.delete_old_access_logs",
+                    {},
+                    user_id=None,
+                    unique_name=True,
+                    repeat_delay=self._delete_access_log_frequency,
+                    session=session,
+                )
 
-    def add_internal_job_server_stats(self, delay: float, *, session: Optional[Session] = None):
-        """
-        Adds an internal job to update the server statistics
-
-        Parameters
-        ----------
-        delay
-            Schedule for this many seconds in the future
-        session
-            An existing SQLAlchemy session to use. If None, one will be created. If an existing session
-            is used, it will be flushed (but not committed) before returning from this function.
-        """
-        with self.root_socket.optional_session(session) as session:
-            self.root_socket.internal_jobs.add(
-                "update_server_stats",
-                now_at_utc() + timedelta(seconds=delay),
-                "serverinfo.update_server_stats",
-                {},
-                user_id=None,
-                unique_name=True,
-                after_function="serverinfo.add_internal_job_server_stats",
-                after_function_kwargs={"delay": self._server_stats_frequency},
-                session=session,
-            )
-
-    def add_internal_job_update_geoip2(self, delay: float, *, session: Optional[Session] = None):
-        """
-        Adds an internal job to update the geoip database
-        """
-
-        # Only add this if we have the maxmind license key
-        if not (self._geoip2_enabled and self._maxmind_license_key):
-            return
-
-        with self.root_socket.optional_session(session) as session:
-            self.root_socket.internal_jobs.add(
-                "update_geoip2_file",
-                now_at_utc() + timedelta(seconds=delay),
-                "serverinfo.update_geoip2_file",
-                {},
-                user_id=None,
-                unique_name=True,
-                after_function="serverinfo.add_internal_job_update_geoip2",
-                after_function_kwargs={"delay": self._update_geoip2_frequency},  # wait one day
-                session=session,
-            )
-
-    def add_internal_job_geolocate_accesses(self, delay: float, *, session: Optional[Session] = None):
-        """
-        Adds an internal job to update the access log with geolocation information
-        """
-
-        if not self._geoip2_enabled:
-            return
-
-        with self.root_socket.optional_session(session) as session:
-            self.root_socket.internal_jobs.add(
-                "geolocate_accesses",
-                now_at_utc() + timedelta(seconds=delay),
-                "serverinfo.geolocate_accesses",
-                {},
-                user_id=None,
-                unique_name=True,
-                after_function="serverinfo.add_internal_job_geolocate_accesses",
-                after_function_kwargs={"delay": self._geolocate_accesses_frequency},  # wait 2 minutes
-                session=session,
-            )
-
-    def update_geoip2_file(self, session: Session, job_progress: JobProgress) -> None:
+    def update_geoip2_file(self) -> None:
         # Possible to reach this if we changed the settings, but have a job still in the queue
         if not (self._geoip2_enabled and self._maxmind_license_key):
             return
@@ -238,7 +200,7 @@ class ServerInfoSocket:
 
         self._logger.info(f"Geoip database (date {db_date}) downloaded and extracted to {self._geoip2_dir}")
 
-    def geolocate_accesses(self, session: Session, job_progress: JobProgress) -> None:
+    def geolocate_accesses(self, session: Session) -> None:
         """
         Finds and updates accesses which haven't been processed for geolocation data
         """
@@ -309,6 +271,19 @@ class ServerInfoSocket:
         last_geolocated_date.date_value = to_process[-1].timestamp
 
         session.commit()
+
+    def delete_old_access_logs(self, session: Session) -> None:
+        """
+        Deletes old access logs (as defined by the configuration)
+        """
+
+        # we check when adding the job, but double check here
+        if self._access_log_keep <= 0 or not self._access_log_enabled:
+            return
+
+        before = now_at_utc() - timedelta(seconds=self._access_log_keep)
+        num_deleted = self.delete_access_logs(before, session=session)
+        self._logger.info(f"Deleted {num_deleted} access logs before {before}")
 
     def _load_motd(self, *, session: Optional[Session] = None):
         stmt = select(MessageOfTheDayORM).order_by(MessageOfTheDayORM.id)
@@ -385,92 +360,6 @@ class ServerInfoSocket:
             session.add(log)
             session.flush()
             return log.id
-
-    def update_server_stats(self, session: Session, job_progress: JobProgress) -> None:
-        """
-        Obtains some statistics about the server and stores them in the database
-
-        Parameters
-        ----------
-        session
-            An existing SQLAlchemy session to use. If None, one will be created. If an existing session
-            is used, it will be flushed (but not committed) before returning from this function.
-        """
-
-        table_list = [BaseDatasetORM, MoleculeORM, BaseRecordORM, OutputStoreORM, AccessLogORM, InternalErrorLogORM]
-        db_name = self.root_socket.qcf_config.database.database_name
-
-        table_counts = {}
-        with self.root_socket.optional_session(session) as session:
-            # total size of the database
-            db_size = session.execute(text("SELECT pg_database_size(:dbname)"), {"dbname": db_name}).scalar()
-
-            # Count the number of rows in each table
-            for table in table_list:
-                table_name = table.__tablename__
-                table_counts[table_name] = session.execute(text(f"SELECT count(*) FROM {table_name}")).scalar()
-
-            table_info_sql = f"""
-                    SELECT relname                                AS table_name
-                         , c.reltuples::BIGINT                    AS row_estimate
-                         , pg_total_relation_size(c.oid)          AS total_bytes
-                         , pg_indexes_size(c.oid)                 AS index_bytes
-                         , pg_total_relation_size(reltoastrelid)  AS toast_bytes
-                    FROM pg_class c
-                             LEFT JOIN pg_namespace n ON n.oid = c.relnamespace
-                    WHERE relkind = 'r' AND relname NOT LIKE 'pg_%' AND relname NOT LIKE 'sql_%';
-            """
-
-            table_info_result = session.execute(text(table_info_sql)).fetchall()
-
-            table_info_rows = [list(r) for r in table_info_result]
-            table_info = {
-                "columns": ["table_name", "row_estimate", "total_bytes", "index_bytes", "toast_bytes"],
-                "rows": table_info_rows,
-            }
-
-            # Task queue and Service queue status
-            task_query = (
-                session.query(BaseRecordORM.record_type, BaseRecordORM.status, func.count(TaskQueueORM.id))
-                .join(BaseRecordORM, BaseRecordORM.id == TaskQueueORM.record_id)
-                .group_by(BaseRecordORM.record_type, BaseRecordORM.status)
-                .all()
-            )
-            task_stats = {"columns": ["record_type", "status", "count"], "rows": [list(r) for r in task_query]}
-
-            service_query = (
-                session.query(BaseRecordORM.record_type, BaseRecordORM.status, func.count(ServiceQueueORM.id))
-                .join(BaseRecordORM, BaseRecordORM.id == ServiceQueueORM.record_id)
-                .group_by(BaseRecordORM.record_type, BaseRecordORM.status)
-                .all()
-            )
-            service_stats = {"columns": ["record_type", "status", "count"], "rows": [list(r) for r in service_query]}
-
-            # Calculate combined table info
-            table_size = 0
-            index_size = 0
-            for row in table_info_rows:
-                table_size += row[2] - row[3] - (row[4] or 0)
-                index_size += row[3]
-
-            # Build out final data
-            data = {
-                "collection_count": table_counts[BaseDatasetORM.__tablename__],
-                "molecule_count": table_counts[MoleculeORM.__tablename__],
-                "record_count": table_counts[BaseRecordORM.__tablename__],
-                "outputstore_count": table_counts[OutputStoreORM.__tablename__],
-                "access_count": table_counts[AccessLogORM.__tablename__],
-                "error_count": table_counts[InternalErrorLogORM.__tablename__],
-                "task_queue_status": task_stats,
-                "service_queue_status": service_stats,
-                "db_total_size": db_size,
-                "db_table_size": table_size,
-                "db_index_size": index_size,
-                "db_table_information": table_info,
-            }
-
-            log = ServerStatsLogORM(**data)
-            session.add(log)
 
     def query_access_log(
         self,
@@ -697,54 +586,6 @@ class ServerInfoSocket:
 
         return result_dicts
 
-    def query_server_stats(
-        self,
-        query_data: ServerStatsQueryFilters,
-        *,
-        session: Optional[Session] = None,
-    ) -> List[Dict[str, Any]]:
-        """
-        General query of server statistics
-
-        All search criteria are merged via 'and'. Therefore, records will only
-        be found that match all the criteria.
-
-        Parameters
-        ----------
-        query_data
-            Fields/filters to query for
-        session
-            An existing SQLAlchemy session to use. If None, one will be created. If an existing session
-            is used, it will be flushed (but not committed) before returning from this function.
-
-        Returns
-        -------
-        :
-            A list of server statistic entries (as dictionaries) that were found in the database.
-        """
-
-        and_query = []
-        if query_data.before:
-            and_query.append(ServerStatsLogORM.timestamp <= query_data.before)
-        if query_data.after:
-            and_query.append(ServerStatsLogORM.timestamp >= query_data.after)
-
-        with self.root_socket.optional_session(session, True) as session:
-            stmt = select(ServerStatsLogORM).filter(and_(True, *and_query))
-
-            if query_data.cursor is not None:
-                stmt = stmt.where(ServerStatsLogORM.id < query_data.cursor)
-
-            stmt = stmt.order_by(ServerStatsLogORM.id.desc())
-            stmt = stmt.limit(query_data.limit)
-            stmt = stmt.distinct(ServerStatsLogORM.id)
-            results = session.execute(stmt).scalars().all()
-
-            # TODO - could be done in sql query (with subquery?)
-            result_dicts = [x.model_dict() for x in sorted(results, key=lambda x: x.timestamp, reverse=True)]
-
-        return result_dicts
-
     def delete_access_logs(self, before: datetime, *, session: Optional[Session] = None) -> int:
         """
         Deletes access logs that were created before a certain date & time
@@ -786,27 +627,5 @@ class ServerInfoSocket:
 
         with self.root_socket.optional_session(session, False) as session:
             stmt = delete(InternalErrorLogORM).where(InternalErrorLogORM.error_date < before)
-            r = session.execute(stmt)
-            return r.rowcount
-
-    def delete_server_stats(self, before: datetime, *, session: Optional[Session] = None) -> int:
-        """
-        Deletes server statistics that were created before a certain date & time
-
-        Parameters
-        ----------
-        before
-            Delete server stats before this time
-        session
-            An existing SQLAlchemy session to use. If None, one will be created. If an existing session
-            is used, it will be flushed (but not committed) before returning from this function.
-
-        Returns
-        -------
-            The number of deleted entries
-        """
-
-        with self.root_socket.optional_session(session, False) as session:
-            stmt = delete(ServerStatsLogORM).where(ServerStatsLogORM.timestamp < before)
             r = session.execute(stmt)
             return r.rowcount

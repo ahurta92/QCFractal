@@ -1,6 +1,19 @@
 from __future__ import annotations
 
-from sqlalchemy import Column, Integer, ForeignKey, String, UniqueConstraint, Index, Boolean, event, DDL
+from typing import TYPE_CHECKING
+
+from sqlalchemy import (
+    Column,
+    Integer,
+    ForeignKey,
+    String,
+    UniqueConstraint,
+    CheckConstraint,
+    Index,
+    Boolean,
+    event,
+    DDL,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.orderinglist import ordering_list
 from sqlalchemy.orm import relationship
@@ -10,6 +23,9 @@ from qcfractal.components.optimization.record_db_models import OptimizationRecor
 from qcfractal.components.record_db_models import BaseRecordORM
 from qcfractal.components.singlepoint.record_db_models import QCSpecificationORM, SinglepointRecordORM
 from qcfractal.db_socket import BaseORM
+
+if TYPE_CHECKING:
+    from typing import Dict, Any, Optional, Iterable
 
 
 class NEBOptimizationsORM(BaseORM):
@@ -62,6 +78,7 @@ class NEBSpecificationORM(BaseORM):
     id = Column(Integer, primary_key=True)
 
     program = Column(String(100), nullable=False)
+    specification_hash = Column(String, nullable=False)
 
     singlepoint_specification_id = Column(Integer, ForeignKey(QCSpecificationORM.id), nullable=False)
     singlepoint_specification = relationship(QCSpecificationORM, lazy="joined", uselist=False)
@@ -70,23 +87,29 @@ class NEBSpecificationORM(BaseORM):
     optimization_specification = relationship(OptimizationSpecificationORM, lazy="joined")
 
     keywords = Column(JSONB, nullable=False)
-    keywords_hash = Column(String, nullable=False)
+    protocols = Column(JSONB, nullable=False)
 
     __table_args__ = (
         UniqueConstraint(
-            "program",
+            "specification_hash",
             "singlepoint_specification_id",
             "optimization_specification_id",
-            "keywords_hash",
             name="ux_neb_specification_keys",
         ),
         Index("ix_neb_specification_program", "program"),
         Index("ix_neb_specification_singlepoint_specification_id", "singlepoint_specification_id"),
-        Index("ix_neb_specification_optimization_specification_id", "optimization_specification_id")
-        # Enforce lowercase on some fields
+        Index("ix_neb_specification_optimization_specification_id", "optimization_specification_id"),
+        CheckConstraint("program = LOWER(program)", name="ck_neb_specification_program_lower"),
     )
 
-    _qcportal_model_excludes = ["id", "keywords_hash", "singlepoint_specification_id", "optimization_specification_id"]
+    # TODO - protocols will eventually be in the model
+    _qcportal_model_excludes = [
+        "id",
+        "specification_hash",
+        "singlepoint_specification_id",
+        "optimization_specification_id",
+        "protocols",
+    ]
 
     @property
     def short_description(self) -> str:
@@ -130,6 +153,32 @@ class NEBRecordORM(BaseRecordORM):
     }
 
     _qcportal_model_excludes = [*BaseRecordORM._qcportal_model_excludes, "specification_id"]
+
+    def model_dict(self, exclude: Optional[Iterable[str]] = None) -> Dict[str, Any]:
+        d = BaseRecordORM.model_dict(self, exclude)
+
+        # Return initial molecule or just the ids, depending on what we have
+        if "initial_chain" in d:
+            init_chain = d.pop("initial_chain")
+            d["initial_chain_molecule_ids"] = [x["molecule_id"] for x in init_chain]
+            if "molecule" in init_chain[0]:
+                d["initial_chain"] = [x["molecule"] for x in init_chain]
+
+        if "optimizations" in d:
+            optimizations = d.pop("optimizations")
+
+            opt_dict = {}
+            for opt in optimizations:
+                if opt["ts"]:
+                    opt_dict["transition"] = opt
+                elif opt["position"] == 0:
+                    opt_dict["initial"] = opt
+                else:
+                    opt_dict["final"] = opt
+
+            d["optimizations"] = opt_dict
+
+        return d
 
     @property
     def short_description(self) -> str:

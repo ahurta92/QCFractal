@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import logging
+from collections import defaultdict
 from typing import TYPE_CHECKING
 
 from qcelemental.models import FailedOperation
-from sqlalchemy import select, union, or_, func
+from sqlalchemy import select, delete, update, union, or_, func, text
 from sqlalchemy.orm import (
     joinedload,
     selectinload,
@@ -30,7 +31,7 @@ from qcportal.exceptions import UserReportableError, MissingDataError
 from qcportal.managers.models import ManagerStatusEnum
 from qcportal.metadata_models import DeleteMetadata, UpdateMetadata
 from qcportal.record_models import PriorityEnum, RecordStatusEnum, OutputTypeEnum
-from qcportal.utils import chunk_iterable, now_at_utc
+from qcportal.utils import chunk_iterable, now_at_utc, is_included
 from .record_db_models import (
     RecordComputeHistoryORM,
     BaseRecordORM,
@@ -110,7 +111,10 @@ class BaseRecordSocket:
         Create an entry in the task queue, and attach it to the given record ORM
         """
 
-        record_orm.task = TaskQueueORM(tag=tag, priority=priority, required_programs=record_orm.required_programs)
+        available = record_orm.status == RecordStatusEnum.waiting
+        record_orm.task = TaskQueueORM(
+            tag=tag, priority=priority, required_programs=record_orm.required_programs, available=available
+        )
 
     @staticmethod
     def create_service(record_orm: BaseRecordORM, tag: str, priority: PriorityEnum, find_existing: bool) -> None:
@@ -157,10 +161,34 @@ class BaseRecordSocket:
             If missing_ok is True, then this list will contain None where the molecule was missing.
         """
 
-        with self.root_socket.optional_session(session, True) as session:
-            return get_general(session, self.record_orm, self.record_orm.id, record_ids, include, exclude, missing_ok)
+        raise NotImplementedError(f"get function not implemented for {type(self)}! This is a developer error")
 
-    def generate_task_specification(self, record_orm: BaseRecordORM) -> Dict[str, Any]:
+    def query(
+        self,
+        query_data: RecordQueryFilters,
+        *,
+        session: Optional[Session] = None,
+    ) -> List[int]:
+        """
+        Query records of a particular type
+
+        Parameters
+        ----------
+        query_data
+            Fields/filters to query for
+        session
+            An existing SQLAlchemy session to use. If None, one will be created. If an existing session
+            is used, it will be flushed (but not committed) before returning from this function.
+
+        Returns
+        -------
+        :
+            A list of record ids that were found in the database.
+        """
+
+        raise NotImplementedError(f"query function not implemented for {type(self)}! This is a developer error")
+
+    def generate_task_specifications(self, session: Session, record_ids: Sequence[int]) -> List[Dict[str, Any]]:
         """
         Generate the actual QCSchema input and related fields for a task
         """
@@ -169,23 +197,21 @@ class BaseRecordSocket:
             f"generate_task_specification not implemented for {type(self)}! This is a developer error"
         )
 
-    def update_completed_task(
-        self, session: Session, record_orm: BaseRecordORM, result: AllResultTypes, manager_name: str
-    ) -> None:
+    def update_completed_task(self, session: Session, record_id: int, result: AllResultTypes) -> None:
         """
         Update a record ORM based on the result of a successfully-completed computation
         """
         raise NotImplementedError(f"updated_completed not implemented for {type(self)}! This is a developer error")
 
-    def insert_complete_record(
+    def insert_complete_schema_v1(
         self,
         session: Session,
-        result: AllResultTypes,
-    ) -> BaseRecordORM:
+        results: Sequence[AllResultTypes],
+    ) -> List[BaseRecordORM]:
         """
-        Create a new ORM based on the result of a successfully-completed computation
+        Insert records into the database from a QCSchema result
 
-        This will always create new ORM from scratch, and not update any existing records.
+        This will always create new ORMs from scratch, and not update any existing records.
         """
         raise NotImplementedError(f"insert_completed not implemented for {type(self)}! This is a developer error")
 
@@ -458,6 +484,23 @@ class BaseRecordSocket:
         with self.root_socket.optional_session(session, True) as session:
             res = session.execute(stmt).all()
             return {x: y for x, y in res}
+
+    def get_children_errors(self, record_id: int, *, session: Optional[Session] = None) -> List[int]:
+        # Get the SQL 'select' statements from the handlers
+        select_stmts = self.get_children_select()
+
+        if not select_stmts:
+            return []
+
+        select_cte = union(*select_stmts).cte()
+
+        stmt = select(select_cte.c.child_id).distinct(select_cte.c.child_id)
+        stmt = stmt.join(BaseRecordORM, BaseRecordORM.id == select_cte.c.child_id)
+        stmt = stmt.where(select_cte.c.parent_id == record_id)
+        stmt = stmt.where(BaseRecordORM.status == RecordStatusEnum.error)
+
+        with self.root_socket.optional_session(session, True) as session:
+            return session.execute(stmt).scalars().all()
 
 
 class RecordSocket:
@@ -784,6 +827,43 @@ class RecordSocket:
             session=session,
         )
 
+    def get_base(
+        self,
+        orm_type: Type[BaseRecordORM],
+        record_ids: Sequence[int],
+        include: Optional[Sequence[str]] = None,
+        exclude: Optional[Sequence[str]] = None,
+        missing_ok: bool = False,
+        additional_options: Optional[List[Any]] = None,
+        *,
+        session: Optional[Session] = None,
+    ):
+        options = []
+        if include is not None:
+            include_history = is_included("compute_history", include, exclude, False)
+            include_outputs = is_included("outputs", include, exclude, False)
+
+            if include_history or include_outputs:
+                options.append(selectinload(orm_type.compute_history))
+            if include_outputs:
+                options.append(
+                    selectinload(orm_type.compute_history, RecordComputeHistoryORM.outputs).undefer(OutputStoreORM.data)
+                )
+            if is_included("task", include, exclude, False):
+                options.append(joinedload(orm_type.task))
+            if is_included("service", include, exclude, False):
+                options.append(joinedload(orm_type.service))
+            if is_included("comments", include, exclude, False):
+                options.append(selectinload(orm_type.comments))
+            if is_included("native_files", include, exclude, False):
+                options.append(selectinload(orm_type.native_files).options(undefer(NativeFileORM.data)))
+
+        if additional_options:
+            options.extend(additional_options)
+
+        with self.root_socket.optional_session(session, True) as session:
+            return get_general(session, orm_type, orm_type.id, record_ids, include, exclude, missing_ok, options)
+
     def get(
         self,
         record_ids: Sequence[int],
@@ -820,35 +900,23 @@ class RecordSocket:
 
         # If all columns are included, then we can load
         # the data from derived classes as well.
-        if (include is None or "*" in include) and not exclude:
+        if (include is None or "*" in include or "**" in include) and not exclude:
             wp = with_polymorphic(BaseRecordORM, "*")
         else:
             wp = BaseRecordORM
 
-        with self.root_socket.optional_session(session, True) as session:
-            return get_general(session, wp, wp.id, record_ids, include, exclude, missing_ok)
-
-    def generate_task_specification(self, task_orm: TaskQueueORM) -> Dict[str, Any]:
-        """
-        Generate the actual QCSchema input and related fields for a task
-        """
-
-        record_type = task_orm.record.record_type
-        return self._handler_map[record_type].generate_task_specification(task_orm.record)
+        return self.get_base(wp, record_ids, include, exclude, missing_ok, session=session)
 
     def create_compute_history_entry(
         self,
-        session: Session,
         result: AllResultTypes,
     ) -> RecordComputeHistoryORM:
         """
         Retrieves status and (possibly compressed) outputs from a result, and creates
         a record computation history entry
         """
-        logger = logging.getLogger(__name__)
-
         history_orm = RecordComputeHistoryORM()
-        history_orm.status = "complete" if result.success else "error"
+        history_orm.status = RecordStatusEnum.complete if result.success else RecordStatusEnum.error
         history_orm.provenance = result.provenance.dict()
         history_orm.modified_on = now_at_utc()
 
@@ -867,43 +935,57 @@ class RecordSocket:
                 history_orm.outputs[output_type] = out_orm
 
         else:
-            # This generally shouldn't happen, but if they aren't compressed, check for uncompressed
             if result.stdout is not None:
-                logger.warning(f"Found uncompressed stdout for record id {result.id}")
-                stdout_orm = self.create_output_orm(session, OutputTypeEnum.stdout, result.stdout)
+                stdout_orm = self.create_output_orm(OutputTypeEnum.stdout, result.stdout)
                 history_orm.outputs["stdout"] = stdout_orm
             if result.stderr is not None:
-                logger.warning(f"Found uncompressed stderr for record id {result.id}")
-                stderr_orm = self.create_output_orm(session, OutputTypeEnum.stderr, result.stderr)
+                stderr_orm = self.create_output_orm(OutputTypeEnum.stderr, result.stderr)
                 history_orm.outputs["stderr"] = stderr_orm
             if result.error is not None:
-                logger.warning(f"Found uncompressed error for record id {result.id}")
-                error_orm = self.create_output_orm(session, OutputTypeEnum.error, result.error.dict())
+                error_orm = self.create_output_orm(OutputTypeEnum.error, result.error.dict())
                 history_orm.outputs["error"] = error_orm
 
         return history_orm
 
-    def native_files_to_orm(self, session: Session, result: AllResultTypes) -> Dict[str, NativeFileORM]:
+    def create_native_files_orms(self, result: AllResultTypes) -> Dict[str, NativeFileORM]:
         """
         Convert the native files stored in a QCElemental result to an ORM
         """
 
-        compressed_nf = result.extras.pop("_qcfractal_compressed_native_files", {})
+        compressed_nf = result.extras.pop("_qcfractal_compressed_native_files", None)
 
-        native_files = {}
-        for name, nf_data in compressed_nf.items():
-            # nf_data is a dictionary with keys 'data', 'compression_type', "compression_level"
-            nf_orm = NativeFileORM(
-                name=name,
-                compression_type=nf_data["compression_type"],
-                compression_level=nf_data["compression_level"],
-                data=nf_data["data"],
-            )
-            native_files[name] = nf_orm
+        if compressed_nf is not None:
+            native_files = {}
+            for name, nf_data in compressed_nf.items():
+                # nf_data is a dictionary with keys 'data', 'compression_type', "compression_level"
+                nf_orm = NativeFileORM(
+                    name=name,
+                    compression_type=nf_data["compression_type"],
+                    compression_level=nf_data["compression_level"],
+                    data=nf_data["data"],
+                )
+                native_files[name] = nf_orm
 
-        return native_files
+            return native_files
+        elif "native_files" in result.__fields__:  # Not compressed, but part of result
+            native_files = {}
+            for name, nf_data in result.native_files.items():
 
-    def create_output_orm(self, session: Session, output_type: OutputTypeEnum, output: Any) -> OutputStoreORM:
+                compressed_data, compression_type, compression_level = compress(nf_data, CompressionEnum.zstd)
+                nf_orm = NativeFileORM(
+                    name=name,
+                    compression_type=compression_type,
+                    compression_level=compression_level,
+                    data=compressed_data,
+                )
+
+                native_files[name] = nf_orm
+
+            return native_files
+        else:
+            return {}
+
+    def create_output_orm(self, output_type: OutputTypeEnum, output: Any) -> OutputStoreORM:
         compressed_out, compression_type, compression_level = compress(output, CompressionEnum.zstd)
         out_orm = OutputStoreORM(
             output_type=output_type,
@@ -953,12 +1035,12 @@ class RecordSocket:
             out_orm.compression_type = new_ctype
             out_orm.compression_level = new_clevel
         else:
-            compute_history.outputs[output_type] = self.create_output_orm(session, output_type, to_append)
+            compute_history.outputs[output_type] = self.create_output_orm(output_type, to_append)
 
         session.flush()
 
     def update_completed_task(
-        self, session: Session, record_orm: BaseRecordORM, result: AllResultTypes, manager_name: str
+        self, session: Session, record_id: int, record_type: str, result: AllResultTypes, manager_name: str
     ):
         """
         Update a record ORM based on the results of a successfully-completed computation
@@ -967,68 +1049,68 @@ class RecordSocket:
         ----------
         session
             An existing SQLAlchemy session
-        record_orm
-            ORM to update and mark as completed
+        record_id
+            ID of the record to update and mark as completed
+        record_type
+            Type of record to update
         result
             The result of the computation. This should be a successful result
         manager_name
             The manager that produced the result
         """
 
-        if isinstance(result, FailedOperation) or not result.success:
-            raise RuntimeError("Developer error - this function only handles successful results")
-
-        if record_orm.is_service:
-            raise RuntimeError("Cannot update completed task with a service")
-
-        # For slow migration
-        # This is for handling edge cases w.r.t. restarts
-        record_orm.new_properties = None
-        record_orm.new_extras = None
-
-        handler = self._handler_map[record_orm.record_type]
-
         # Do these before calling the record-specific handler
         # (these may pull stuff out of extras)
-        history_orm = self.create_compute_history_entry(session, result)
-        native_files_orm = self.native_files_to_orm(session, result)
+        history_orm = self.create_compute_history_entry(result)
+        history_orm.record_id = record_id
+        history_orm.manager_name = manager_name
+        session.add(history_orm)
 
-        # Update record-specific fields
-        handler.update_completed_task(session, record_orm, result, manager_name)
+        native_files_orms = self.create_native_files_orms(result)
+        for v in native_files_orms.values():
+            v.record_id = record_id
+            session.add(v)
+
+        # Now update fields specific to each record
+        record_socket = self._handler_map[record_type]
+        record_socket.update_completed_task(session, record_id, result)
 
         # Now extras and properties
         extras, properties = build_extras_properties(result)
-        record_orm.extras = extras
-        record_orm.properties = properties
 
-        # Now do everything common to all records
-        # Get the outputs & status, storing in the history orm
-        history_orm.manager_name = manager_name
-        record_orm.compute_history.append(history_orm)
-        record_orm.native_files = native_files_orm
+        # What updates we have for this record
+        record_updates = {
+            "extras": extras,
+            "properties": properties,
+            "status": RecordStatusEnum.complete,
+            "manager_name": manager_name,
+            "modified_on": history_orm.modified_on,
+        }
 
-        record_orm.status = history_orm.status
-        record_orm.manager_name = manager_name
-        record_orm.modified_on = history_orm.modified_on
+        # Actually update the record
+        stmt = update(BaseRecordORM).where(BaseRecordORM.id == record_id).values(record_updates)
+        session.execute(stmt)
 
         # Delete the task from the task queue since it is completed
-        session.delete(record_orm.task)
+        stmt = delete(TaskQueueORM).where(TaskQueueORM.record_id == record_id)
+        session.execute(stmt)
 
-    def update_failed_task(
-        self, session: Session, record_orm: BaseRecordORM, failed_result: FailedOperation, manager_name: str
-    ):
+    def update_failed_task(self, session: Session, record_id: int, failed_result: FailedOperation, manager_name: str):
         """
         Update a record ORM whose computation has failed, and mark it as errored
 
         Parameters
         ----------
-        record_orm
-            ORM to update and mark as errored
+        session
+            An existing SQLAlchemy session
+        record_id
+            ID of the record to update and mark as completed
         failed_result
             The (failed) result of the computation
         manager_name
             The manager that produced the result
         """
+
         if not isinstance(failed_result, FailedOperation):
             raise RuntimeError("Developer error - this function only handles FailedOperation results")
 
@@ -1038,7 +1120,7 @@ class RecordSocket:
         if error is None:
             error = _default_error
 
-        error_out_orm = self.create_output_orm(session, OutputTypeEnum.error, error.dict())
+        error_out_orm = self.create_output_orm(OutputTypeEnum.error, error.dict())
         all_outputs = {OutputTypeEnum.error: error_out_orm}
 
         # Get the rest of the outputs
@@ -1049,10 +1131,10 @@ class RecordSocket:
             stderr = failed_result.input_data.get("stderr", None)
 
             if stdout is not None:
-                stdout_orm = self.create_output_orm(session, OutputTypeEnum.stdout, stdout)
+                stdout_orm = self.create_output_orm(OutputTypeEnum.stdout, stdout)
                 all_outputs[OutputTypeEnum.stdout] = stdout_orm
             if stderr is not None:
-                stderr_orm = self.create_output_orm(session, OutputTypeEnum.stderr, stderr)
+                stderr_orm = self.create_output_orm(OutputTypeEnum.stderr, stderr)
                 all_outputs[OutputTypeEnum.stderr] = stderr_orm
 
         # Build the history orm
@@ -1061,11 +1143,19 @@ class RecordSocket:
         history_orm.manager_name = manager_name
         history_orm.modified_on = now_at_utc()
         history_orm.outputs = all_outputs
+        history_orm.record_id = record_id
+        session.add(history_orm)
 
-        record_orm.status = RecordStatusEnum.error
-        record_orm.modified_on = history_orm.modified_on
-        record_orm.manager_name = manager_name
-        record_orm.compute_history.append(history_orm)
+        # What updates we have for this record
+        record_updates = {
+            "status": RecordStatusEnum.error,
+            "modified_on": history_orm.modified_on,
+            "manager_name": manager_name,
+        }
+
+        # Actually update the record
+        stmt = update(BaseRecordORM).where(BaseRecordORM.id == record_id).values(record_updates)
+        session.execute(stmt)
 
     def initialize_service(self, session: Session, service_orm: ServiceQueueORM) -> None:
         """
@@ -1112,8 +1202,35 @@ class RecordSocket:
             )
             return False
 
-        else:
-            return service_socket.iterate_service(session, service_orm)
+        # Actually iterate the service
+        finished = service_socket.iterate_service(session, service_orm)
+
+        if not finished:
+            # Update the sort_date on any tasks that were created
+            # The sort date should almost always be the created_on of the parent service
+            # This way, earlier services will have their tasks run first, rather than having to wait
+            # for all other services' tasks to finish
+            # But, it could be the original submission date of the record
+            parent_created_on = service_orm.record.created_on
+
+            stmt = """
+                WITH tq_cte AS (
+                    SELECT tq.id FROM task_queue tq
+                    INNER JOIN service_dependency sd ON tq.record_id = sd.record_id
+                    WHERE sd.service_id = :service_id
+                    AND tq.available = true
+                    AND tq.sort_date > :parent_created_on
+                    FOR UPDATE OF tq SKIP LOCKED
+                )
+                UPDATE task_queue AS tq
+                SET sort_date = :parent_created_on
+                FROM tq_cte
+                WHERE tq_cte.id = tq.id
+            """
+
+            session.execute(text(stmt), {"parent_created_on": parent_created_on, "service_id": service_orm.id})
+
+        return finished
 
     def update_failed_service(self, session, record_orm: BaseRecordORM, error_info: Dict[str, Any]):
         """
@@ -1121,7 +1238,7 @@ class RecordSocket:
         """
         record_orm.status = RecordStatusEnum.error
 
-        error_orm = self.create_output_orm(session, OutputTypeEnum.error, error_info)
+        error_orm = self.create_output_orm(OutputTypeEnum.error, error_info)
         record_orm.compute_history[-1].status = RecordStatusEnum.error
 
         self.upsert_output(session, record_orm, error_orm)
@@ -1130,44 +1247,71 @@ class RecordSocket:
         record_orm.status = RecordStatusEnum.error
         record_orm.modified_on = now_at_utc()
 
-    def insert_complete_record(self, session: Session, results: Sequence[AllResultTypes]) -> List[int]:
+    def insert_complete_schema_v1(self, session: Session, results: Sequence[AllResultTypes]) -> List[int]:
         """
-        Create a new ORM based on the result of a successfully-completed computation
+        Insert records into the database from a QCSchema result
 
-        This will always create new ORM from scratch, and not update any existing records.
+        This will always create new ORMs from scratch, and not update any existing records.
         """
 
-        ids = []
+        if len(results) == 0:
+            return []
 
-        for result in results:
+        # Map of schema name stored in the result to (index, result)
+        type_map: Dict[str, List[Tuple[int, AllResultTypes]]] = defaultdict(list)
+
+        for idx, result in enumerate(results):
             if isinstance(result, FailedOperation) or not result.success:
                 raise UserReportableError("Cannot insert a completed, failed operation")
 
+            type_map[result.schema_name].append((idx, result))
+
+        # Key is the index in the original "results" dict
+        to_add: List[Tuple[int, BaseRecordORM]] = []
+
+        for schema_name, idx_results in type_map.items():
             # Get the outputs & status, storing in the history orm.
             # Do this before calling the individual record handlers since it modifies extras
             # (looking for compressed outputs and compressed native files)
-            history_orm = self.create_compute_history_entry(session, result)
-            native_files_orm = self.native_files_to_orm(session, result)
+
+            # idx_results is a list of tuple (idx, result). idx is the index in the
+            # original results (function parameter)
+            type_results = [r for _, r in idx_results]
+            history_orms = [self.create_compute_history_entry(r) for r in type_results]
+            native_files_orms = [self.create_native_files_orms(r) for r in type_results]
 
             # Now the record-specific stuff
-            handler = self._handler_map_by_schema[result.schema_name]
-            record_orm = handler.insert_complete_record(session, result)
+            handler = self._handler_map_by_schema[schema_name]
+            record_orms = handler.insert_complete_schema_v1(session, type_results)
 
-            # Now extras and properties
-            extras, properties = build_extras_properties(result)
-            record_orm.extras = extras
-            record_orm.properties = properties
+            for record_orm, history_orm, native_files_orm, (idx, type_result) in zip(
+                record_orms, history_orms, native_files_orms, idx_results
+            ):
+                record_orm.is_service = False
 
-            # Now back to the common modifications
-            record_orm.compute_history.append(history_orm)
-            record_orm.native_files = native_files_orm
-            record_orm.status = history_orm.status
-            record_orm.modified_on = history_orm.modified_on
+                # Now extras and properties
+                extras, properties = build_extras_properties(type_result)
+                record_orm.extras = extras
+                record_orm.properties = properties
 
-            session.flush()
-            ids.append(record_orm.id)
+                # Now back to the common modifications
+                record_orm.compute_history.append(history_orm)
+                record_orm.native_files = native_files_orm
+                record_orm.status = history_orm.status
+                record_orm.modified_on = history_orm.modified_on
 
-        return ids
+                to_add.append((idx, record_orm))
+
+        to_add.sort()
+
+        # Check that everything is in the original order
+        assert tuple(idx for idx, _ in to_add) == tuple(range(len(to_add)))
+        to_add_orm = [o for _, o in to_add]
+
+        session.add_all(to_add_orm)
+        session.flush()
+
+        return [o.id for o in to_add_orm]
 
     def add_comment(
         self, record_ids: Sequence[int], user_id: Optional[int], comment: str, *, session: Optional[Session] = None
@@ -1256,6 +1400,7 @@ class RecordSocket:
                 r.status = RecordStatusEnum.waiting
                 r.modified_on = now_at_utc()
                 r.manager_name = None
+                r.task.available = True
 
             return [r.id for r in record_orms]
 
@@ -1340,6 +1485,9 @@ class RecordSocket:
                         r_orm.status = RecordStatusEnum.waiting
                         r_orm.manager_name = None
 
+                        if not r_orm.is_service:
+                            r_orm.task.available = True
+
                     else:
                         if r_orm.info_backup:
                             raise RuntimeError(f"resetting record with status {r_orm.status} with backup info present")
@@ -1349,6 +1497,13 @@ class RecordSocket:
                             )
 
                     r_orm.modified_on = now_at_utc()
+
+                    # Sanity check
+                    if not r_orm.is_service:
+                        if r_orm.status == RecordStatusEnum.waiting:
+                            assert r_orm.task.available == True
+                        else:
+                            assert r_orm.task is None or r_orm.task.available == False
 
                 updated_ids.extend([r.id for r in record_data])
 

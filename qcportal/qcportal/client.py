@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import logging
+import math
+import os
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple, Union, Sequence, Iterable, TypeVar, Type
+from typing import Any, Dict, List, Optional, Tuple, Union, Sequence, Iterable, TypeVar, Type, Literal
 
 from tabulate import tabulate
 
 from qcportal.cache import DatasetCache, read_dataset_metadata
+from qcportal.external_files import ExternalFile
 from qcportal.gridoptimization import (
     GridoptimizationKeywords,
     GridoptimizationAddBody,
@@ -14,9 +17,10 @@ from qcportal.gridoptimization import (
     GridoptimizationQueryFilters,
 )
 from qcportal.manybody import (
-    ManybodyKeywords,
+    BSSECorrectionEnum,
     ManybodyRecord,
     ManybodyAddBody,
+    ManybodyKeywords,
     ManybodyQueryFilters,
 )
 from qcportal.neb import (
@@ -38,7 +42,7 @@ from qcportal.reaction import (
     ReactionKeywords,
     ReactionQueryFilters,
 )
-from qcportal.services.models import (
+from qcportal.services.models import (  # noqa
     ServiceSubtaskRecord,
 )
 from qcportal.singlepoint import (
@@ -74,6 +78,8 @@ from .dataset_models import (
     DatasetDeleteParams,
     DatasetAddBody,
     dataset_from_dict,
+    load_dataset_view,  # noqa
+    create_dataset_view,
 )
 from .internal_jobs import InternalJob, InternalJobQueryFilters, InternalJobQueryIterator, InternalJobStatusEnum
 from .managers import ManagerQueryFilters, ManagerQueryIterator, ComputeManager
@@ -98,11 +104,9 @@ from .serverinfo import (
     AccessLogQueryIterator,
     ErrorLogQueryFilters,
     ErrorLogQueryIterator,
-    ServerStatsQueryFilters,
-    ServerStatsQueryIterator,
     DeleteBeforeDateBody,
 )
-from .utils import make_list, chunk_iterable
+from .utils import make_list, chunk_iterable, process_chunk_iterable
 
 _T = TypeVar("_T", bound=BaseRecord)
 
@@ -264,6 +268,11 @@ class PortalClient(PortalClientBase):
 
         return ds
 
+    def create_dataset_view(
+        self, dataset_id: int, file_path: str, include: Optional[Iterable[str]] = None, overwrite: bool = False
+    ):
+        return create_dataset_view(self, dataset_id, file_path, include, overwrite)
+
     def get_dataset_status_by_id(self, dataset_id: int) -> Dict[str, Dict[RecordStatusEnum, int]]:
         return self.make_request("get", f"api/v1/datasets/{dataset_id}/status", Dict[str, Dict[RecordStatusEnum, int]])
 
@@ -317,6 +326,52 @@ class PortalClient(PortalClientBase):
     def delete_dataset(self, dataset_id: int, delete_records: bool):
         params = DatasetDeleteParams(delete_records=delete_records)
         return self.make_request("delete", f"api/v1/datasets/{dataset_id}", None, url_params=params)
+
+    ##############################################################
+    # External files
+    ##############################################################
+    def download_external_file(self, file_id: int, destination_path: str, overwrite: bool = False) -> Tuple[int, str]:
+        """
+        Downloads an external file to the given path
+
+        The file size and checksum will be checked against the metadata stored on the server
+
+        Parameters
+        ----------
+        file_id
+            ID of the file to obtain
+        destination_path
+            Full path to the destination file (including filename)
+        overwrite
+            If True, allow for overwriting an existing file. If False, and a file already exists at the given
+            destination path, an exception will be raised.
+
+        Returns
+        -------
+        :
+            A tuple of file size and sha256 checksum.
+
+        """
+        meta_url = f"api/v1/external_files/{file_id}"
+        download_url = f"api/v1/external_files/{file_id}/download"
+
+        # Check for local file existence before doing any requests
+        if os.path.exists(destination_path) and not overwrite:
+            raise RuntimeError(f"File already exists at {destination_path}. To overwrite, use `overwrite=True`")
+
+        # First, get the metadata
+        file_info = self.make_request("get", meta_url, ExternalFile)
+
+        # Now actually download the file
+        file_size, file_sha256 = self.download_file(download_url, destination_path, overwrite=overwrite)
+
+        if file_size != file_info.file_size:
+            raise RuntimeError(f"Inconsistent file size. Expected {file_info.file_size}, got {file_size}")
+
+        if file_sha256 != file_info.sha256sum:
+            raise RuntimeError(f"Inconsistent file checksum. Expected {file_info.sha256sum}, got {file_sha256}")
+
+        return file_size, file_sha256
 
     ##############################################################
     # Molecules
@@ -507,6 +562,81 @@ class PortalClient(PortalClientBase):
     # General record functions
     ##############################################################
 
+    def _fetch_records(
+        self,
+        record_type: Optional[Type[_T]],
+        record_ids: Sequence[int],
+        missing_ok: bool = False,
+        include: Optional[Iterable[str]] = None,
+    ) -> List[Optional[_T]]:
+        """
+        Fetches records of a particular type with the specified IDs from the remove server.
+
+        Records will be returned in the same order as the record ids. This function always returns a list.
+
+        This function only fetches the top-level records - it does not fetch the children of the records. It also
+        does not use caching at all.
+
+        Parameters
+        ----------
+        record_type
+            The type of record to fetch
+        record_ids
+            Single ID or sequence/list of records to obtain
+        missing_ok
+            If set to True, then missing records will be tolerated, and the returned
+            records will contain None for the corresponding IDs that were not found.
+        include
+            Additional fields to include in the returned record
+
+        Returns
+        -------
+        :
+            If a single ID was specified, returns just that record. Otherwise, returns
+            a list of records.  If missing_ok was specified, None will be substituted for a record
+            that was not found.
+        """
+
+        if not record_ids:
+            return []
+
+        if include is not None:
+            # Always include the base stuff
+            include = list(include) + ["*"]
+
+        if record_type is None:
+            endpoint = "api/v1/records/bulkGet"
+        else:
+            # A little hacky
+            record_type_str = record_type.__fields__["record_type"].default
+            endpoint = f"api/v1/records/{record_type_str}/bulkGet"
+
+        max_batch_size = self.api_limits["get_records"]
+        initial_batch_size = math.ceil(max_batch_size // 10)
+
+        def _download_chunk(id_chunk: List[int]):
+            body = CommonBulkGetBody(ids=id_chunk, include=include, missing_ok=missing_ok)
+            return self.make_request("post", endpoint, List[Optional[Dict[str, Any]]], body=body)
+
+        all_records = []
+        for record_dicts in process_chunk_iterable(
+            _download_chunk,
+            record_ids,
+            self.download_target_time,
+            max_batch_size,
+            initial_batch_size,
+            self.n_download_threads,
+            keep_order=True,
+        ):
+            if record_type is None:
+                all_records.extend(records_from_dicts(record_dicts, self))
+            else:
+                all_records.extend([record_type(self, **r) if r is not None else None for r in record_dicts])
+
+        # Just to really make sure the process_chunk_iterable code is correct
+        assert all((x is None or x.id == rid) for x, rid in zip(all_records, record_ids))
+        return all_records
+
     def get_records(
         self,
         record_ids: Union[int, Sequence[int]],
@@ -536,50 +666,34 @@ class PortalClient(PortalClientBase):
         Returns
         -------
         :
-            If a single ID was specified, returns just that record. Otherwise, returns
-            a list of records.  If missing_ok was specified, None will be substituted for a record
+            A list of records.  If missing_ok was specified, None will be substituted for a record
             that was not found.
         """
 
-        is_single = not isinstance(record_ids, Sequence)
-
-        record_ids = make_list(record_ids)
-        if not record_ids:
-            return []
-
-        batch_size = self.api_limits["get_records"] // 4
-        all_records = []
-
-        for record_id_batch in chunk_iterable(record_ids, batch_size):
-            body = CommonBulkGetBody(ids=record_id_batch, missing_ok=missing_ok)
-            record_data = self.make_request("post", "api/v1/records/bulkGet", List[Optional[Dict[str, Any]]], body=body)
-            record_batch = records_from_dicts(record_data, self)
-
-            if include:
-                for r in record_batch:
-                    r._handle_includes(include)
-
-            all_records.extend(record_batch)
-
-        if is_single:
-            return all_records[0]
-        else:
-            return all_records
+        return self._get_records_by_type(None, record_ids, missing_ok, include)
 
     def _get_records_by_type(
         self,
-        record_type: Type[_T],
+        record_type: Optional[Type[_T]],
         record_ids: Union[int, Sequence[int]],
         missing_ok: bool = False,
         include: Optional[Iterable[str]] = None,
-    ) -> Union[Optional[Optional[_T]], List[Optional[_T]]]:
+    ) -> Union[Optional[_T], List[Optional[_T]]]:
         """
-        Obtain records of a particular type with the specified IDs.
+        Obtain records of a particular type with the specified IDs from the server.
 
         Records will be returned in the same order as the record ids.
 
+        This function will fetch the children of the records if enough information
+        is fetched of the parent record. This is handled by the various fetch_children_multi
+        class functions of the record types.
+
+        This function does not use the cache.
+
         Parameters
         ----------
+        record_type
+            The type of record to fetch
         record_ids
             Single ID or sequence/list of records to obtain
         missing_ok
@@ -599,32 +713,21 @@ class PortalClient(PortalClientBase):
         is_single = not isinstance(record_ids, Sequence)
 
         record_ids = make_list(record_ids)
-        if not record_ids:
-            return []
+        all_records = self._fetch_records(record_type, record_ids, missing_ok, include)
 
-        # A little hacky
-        record_type_str = record_type.__fields__["record_type"].default
-
-        batch_size = self.api_limits["get_records"] // 4
-        all_records = []
-
-        for record_id_batch in chunk_iterable(record_ids, batch_size):
-            body = CommonBulkGetBody(ids=record_id_batch, missing_ok=missing_ok)
-
-            record_data = self.make_request(
-                "post",
-                f"api/v1/records/{record_type_str}/bulkGet",
-                List[Optional[Dict[str, Any]]],
-                body=body,
-            )
-
-            record_batch = [record_type(self, **r) if r is not None else None for r in record_data]
-
-            if include:
-                for r in record_batch:
-                    r._handle_includes(include)
-
-            all_records.extend(record_batch)
+        # We always force fetch here. Given that this record is not part of the cache, it shouldn't be using any
+        # cache anyway. But the semantics of this function is that is always fetches everything
+        if record_type is None:
+            # Handle disparate record types
+            record_groups = {}
+            for r in all_records:
+                if r is not None:
+                    record_groups.setdefault(r.record_type, [])
+                    record_groups[r.record_type].append(r)
+            for v in record_groups.values():
+                v[0].fetch_children_multi(v, include, force_fetch=True)
+        else:
+            record_type.fetch_children_multi(all_records, include, force_fetch=True)
 
         if is_single:
             return all_records[0]
@@ -1106,7 +1209,7 @@ class PortalClient(PortalClientBase):
         }
 
         filter_data = SinglepointQueryFilters(**filter_dict)
-        return RecordQueryIterator[SinglepointRecord](self, filter_data, "singlepoint", include)
+        return RecordQueryIterator[SinglepointRecord](self, filter_data, SinglepointRecord, include)
 
     ##############################################################
     # Optimization calculations
@@ -1329,7 +1432,7 @@ class PortalClient(PortalClientBase):
         }
 
         filter_data = OptimizationQueryFilters(**filter_dict)
-        return RecordQueryIterator[OptimizationRecord](self, filter_data, "optimization", include)
+        return RecordQueryIterator[OptimizationRecord](self, filter_data, OptimizationRecord, include)
 
     ##############################################################
     # Torsiondrive calculations
@@ -1542,7 +1645,7 @@ class PortalClient(PortalClientBase):
         }
 
         filter_data = TorsiondriveQueryFilters(**filter_dict)
-        return RecordQueryIterator[TorsiondriveRecord](self, filter_data, "torsiondrive", include)
+        return RecordQueryIterator[TorsiondriveRecord](self, filter_data, TorsiondriveRecord, include)
 
     ##############################################################
     # Grid optimization calculations
@@ -1755,7 +1858,7 @@ class PortalClient(PortalClientBase):
         }
 
         filter_data = GridoptimizationQueryFilters(**filter_dict)
-        return RecordQueryIterator[GridoptimizationRecord](self, filter_data, "gridoptimization", include)
+        return RecordQueryIterator[GridoptimizationRecord](self, filter_data, GridoptimizationRecord, include)
 
     ##############################################################
     # Reactions
@@ -1976,7 +2079,7 @@ class PortalClient(PortalClientBase):
         }
 
         filter_data = ReactionQueryFilters(**filter_dict)
-        return RecordQueryIterator[ReactionRecord](self, filter_data, "reaction", include)
+        return RecordQueryIterator[ReactionRecord](self, filter_data, ReactionRecord, include)
 
     ##############################################################
     # Manybody calculations
@@ -1986,8 +2089,9 @@ class PortalClient(PortalClientBase):
         self,
         initial_molecules: Sequence[Union[int, Molecule]],
         program: str,
-        singlepoint_specification: QCSpecification,
-        keywords: ManybodyKeywords,
+        levels: Dict[Union[int, Literal["supersystem"]], QCSpecification],
+        bsse_correction: Union[BSSECorrectionEnum, Sequence[BSSECorrectionEnum]],
+        keywords: Union[ManybodyKeywords, Dict[str, Any]],
         tag: str = "*",
         priority: PriorityEnum = PriorityEnum.normal,
         owner_group: Optional[str] = None,
@@ -2040,7 +2144,8 @@ class PortalClient(PortalClientBase):
             "initial_molecules": initial_molecules,
             "specification": {
                 "program": program,
-                "singlepoint_specification": singlepoint_specification,
+                "levels": levels,
+                "bsse_correction": make_list(bsse_correction),
                 "keywords": keywords,
             },
             "tag": tag,
@@ -2184,7 +2289,7 @@ class PortalClient(PortalClientBase):
         }
 
         filter_data = ManybodyQueryFilters(**filter_dict)
-        return RecordQueryIterator[ManybodyRecord](self, filter_data, "manybody", include)
+        return RecordQueryIterator[ManybodyRecord](self, filter_data, ManybodyRecord, include)
 
     ##############################################################
     # NEB
@@ -2398,7 +2503,7 @@ class PortalClient(PortalClientBase):
         }
 
         filter_data = NEBQueryFilters(**filter_dict)
-        return RecordQueryIterator[NEBRecord](self, filter_data, "neb", include)
+        return RecordQueryIterator[NEBRecord](self, filter_data, NEBRecord, include)
 
     ##############################################################
     # Managers
@@ -2499,59 +2604,6 @@ class PortalClient(PortalClientBase):
 
         filter_data = ManagerQueryFilters(**filter_dict)
         return ManagerQueryIterator(self, filter_data)
-
-    ##############################################################
-    # Server statistics and logs
-    ##############################################################
-
-    def query_server_stats(
-        self,
-        *,
-        before: Optional[Union[datetime, str]] = None,
-        after: Optional[Union[datetime, str]] = None,
-        limit: Optional[int] = None,
-    ) -> ServerStatsQueryIterator:
-        """
-        Query server statistics
-
-        These statistics are captured at certain times, and are available for querying (as long
-        as they are not deleted)
-
-        Parameters
-        ----------
-        before
-            Return statistics captured before the specified date/time
-        after
-            Return statistics captured after the specified date/time
-        limit
-            The maximum number of statistics entries to return. Note that the server limit is always obeyed.
-
-        Returns
-        -------
-        :
-            An iterator that can be used to retrieve the results of the query
-        """
-
-        filter_data = ServerStatsQueryFilters(before=before, after=after, limit=limit)
-        return ServerStatsQueryIterator(self, filter_data)
-
-    def delete_server_stats(self, before: datetime) -> int:
-        """
-        Delete server statistics from the server
-
-        Parameters
-        ----------
-        before
-            Delete statistics captured before the given date/time
-
-        Returns
-        -------
-        :
-            The number of statistics entries deleted from the server
-        """
-
-        body = DeleteBeforeDateBody(before=before)
-        return self.make_request("post", "api/v1/server_stats/bulkDelete", int, body=body)
 
     def query_access_log(
         self,
@@ -2683,7 +2735,8 @@ class PortalClient(PortalClientBase):
         Gets information about an internal job on the server
         """
 
-        return self.make_request("get", f"api/v1/internal_jobs/{job_id}", InternalJob)
+        ij_dict = self.make_request("get", f"api/v1/internal_jobs/{job_id}", Dict[str, Any])
+        return InternalJob(client=self, **ij_dict)
 
     def query_internal_jobs(
         self,

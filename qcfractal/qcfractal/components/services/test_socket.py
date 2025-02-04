@@ -8,12 +8,13 @@ from qcfractal.components.gridoptimization.testing_helpers import (
     submit_test_data as submit_go_test_data,
 )
 from qcfractal.components.record_db_models import BaseRecordORM
+from qcfractal.components.torsiondrive.record_db_models import TorsiondriveRecordORM
 from qcfractal.components.torsiondrive.testing_helpers import (
     submit_test_data as submit_td_test_data,
     generate_task_key as generate_td_task_key,
 )
 from qcfractal.db_socket import SQLAlchemySocket
-from qcfractal.testing_helpers import run_service, DummyJobProgress
+from qcfractal.testing_helpers import run_service
 from qcportal.managers import ManagerName
 from qcportal.record_models import RecordStatusEnum, PriorityEnum
 from qcportal.utils import now_at_utc
@@ -40,7 +41,7 @@ def test_service_socket_error(storage_socket: SQLAlchemySocket, session: Session
 
     assert finished is True
 
-    rec = session.get(BaseRecordORM, id_1)
+    rec = session.get(TorsiondriveRecordORM, id_1)
 
     assert rec.status == RecordStatusEnum.error
 
@@ -55,15 +56,29 @@ def test_service_socket_error(storage_socket: SQLAlchemySocket, session: Session
     err = rec.compute_history[-1].outputs["error"].get_output()
     assert "did not complete successfully" in err["error_message"]
 
+    err_ids = [x.optimization_id for x in rec.optimizations if x.optimization_record.status == RecordStatusEnum.error]
+    assert len(err_ids) == 1
+    child_error_ids = storage_socket.records.torsiondrive.get_children_errors(id_1, session=session)
+    assert len(child_error_ids) == 1
+
+    assert child_error_ids[0] == err_ids[0]
+    child_rec = session.get(BaseRecordORM, child_error_ids[0])
+    assert child_rec.status == RecordStatusEnum.error
+
 
 def test_service_socket_iterate_order(storage_socket: SQLAlchemySocket, session: Session):
-    storage_socket.services._max_active_services = 1
+    # TODO - Ugly
+    max_active_services = storage_socket.services._max_active_services
+    try:
+        storage_socket.services._max_active_services = 1
 
-    id_1, _ = submit_td_test_data(storage_socket, "td_H2O2_mopac_pm6", "*", PriorityEnum.normal)
-    id_2, _ = submit_go_test_data(storage_socket, "go_H3NS_psi4_pbe", "*", PriorityEnum.high)
+        id_1, _ = submit_td_test_data(storage_socket, "td_H2O2_mopac_pm6", "*", PriorityEnum.normal)
+        id_2, _ = submit_go_test_data(storage_socket, "go_H3NS_psi4_pbe", "*", PriorityEnum.high)
 
-    with storage_socket.session_scope() as s:
-        storage_socket.services.iterate_services(s, DummyJobProgress())
+        with storage_socket.session_scope() as s:
+            storage_socket.services.iterate_services(s)
 
-    assert session.get(BaseRecordORM, id_1).status == RecordStatusEnum.waiting
-    assert session.get(BaseRecordORM, id_2).status == RecordStatusEnum.running
+        assert session.get(BaseRecordORM, id_1).status == RecordStatusEnum.waiting
+        assert session.get(BaseRecordORM, id_2).status == RecordStatusEnum.running
+    finally:
+        storage_socket.services._max_active_services = max_active_services

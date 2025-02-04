@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import logging
 import logging.handlers
 import multiprocessing
@@ -16,17 +17,18 @@ import requests
 
 from qcportal import PortalClient
 from qcportal.record_models import RecordStatusEnum
-from .config import FractalConfig, DatabaseConfig, update_nested_dict
-from .flask_app.gunicorn_app import FractalGunicornApp
+from qcportal.utils import update_nested_dict
+from .config import FractalConfig, DatabaseConfig
+from .flask_app.waitress_app import FractalWaitressApp
 from .job_runner import FractalJobRunner
 from .port_util import find_open_port
 from .postgres_harness import create_snowflake_postgres
 
-try:
-    from qcfractalcompute.compute_manager import ComputeManager
-    from qcfractalcompute.config import FractalComputeConfig, FractalServerSettings, LocalExecutorConfig
-except ImportError:
+if importlib.util.find_spec("qcfractalcompute") is None:
     raise RuntimeError("qcfractalcompute is not installed. Snowflake is useless without it")
+
+from qcfractalcompute.compute_manager import ComputeManager
+from qcfractalcompute.config import FractalComputeConfig, FractalServerSettings, LocalExecutorConfig
 
 if TYPE_CHECKING:
     from typing import Dict, Any, Sequence, Optional, Set
@@ -36,7 +38,6 @@ def _api_process(
     qcf_config: FractalConfig,
     logging_queue: multiprocessing.Queue,
     finished_queue: multiprocessing.Queue,
-    started_event: multiprocessing.Event,
 ) -> None:
     import signal
 
@@ -54,12 +55,18 @@ def _api_process(
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    api = FractalGunicornApp(qcf_config, finished_queue, started_event)
+    api = FractalWaitressApp(qcf_config, finished_queue)
 
     if early_stop:
         logging_queue.close()
         logging_queue.join_thread()
         return
+
+    def signal_handler(signum, frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
 
     try:
         api.run()
@@ -163,6 +170,8 @@ class FractalSnowflake:
         compute_workers: int = 2,
         database_config: Optional[DatabaseConfig] = None,
         extra_config: Optional[Dict[str, Any]] = None,
+        *,
+        host: str = "localhost",
     ):
         """A temporary, self-contained server
 
@@ -202,15 +211,14 @@ class FractalSnowflake:
         if database_config is None:
             # db and socket are subdirs of the base temporary directory
             db_dir = os.path.join(self._tmpdir.name, "db")
-            self._pg_harness = create_snowflake_postgres(db_dir)
+            self._pg_harness = create_snowflake_postgres(host, db_dir)
             self._pg_harness.create_database(True)
             db_config = self._pg_harness.config
         else:
             db_config = database_config
 
-        api_host = "127.0.0.1"
-        api_port = find_open_port()
-        self._fractal_uri = f"http://{api_host}:{api_port}"
+        api_port = find_open_port(host)
+        self._fractal_uri = f"http://{host}:{api_port}"
 
         # Create a configuration for QCFractal
         # Assign the log level for subprocesses. Use the same level as what is assigned for this object
@@ -224,9 +232,10 @@ class FractalSnowflake:
         qcf_cfg["hide_internal_errors"] = False
         qcf_cfg["service_frequency"] = 10
         qcf_cfg["heartbeat_frequency"] = 5
+        qcf_cfg["heartbeat_frequency_jitter"] = 0.0
         qcf_cfg["heartbeat_max_missed"] = 3
         qcf_cfg["api"] = {
-            "host": api_host,
+            "host": host,
             "port": api_port,
             "secret_key": secrets.token_urlsafe(32),
             "jwt_secret_key": secrets.token_urlsafe(32),
@@ -243,7 +252,6 @@ class FractalSnowflake:
         ######################################
 
         # For Flask
-        self._api_started = multiprocessing.Event()
         self._finished_queue = self._mp_context.Queue()
         self._all_completed: Set[int] = set()
         self._api_proc = None
@@ -255,6 +263,7 @@ class FractalSnowflake:
             parsl_run_dir=parsl_run_dir,
             cluster="snowflake_compute",
             update_frequency=5,
+            update_frequency_jitter=0.0,
             server=FractalServerSettings(
                 fractal_uri=uri,
                 verify=False,
@@ -303,7 +312,7 @@ class FractalSnowflake:
         if self._api_proc is None:
             self._api_proc = self._mp_context.Process(
                 target=_api_process,
-                args=(self._qcf_config, self._logging_queue, self._finished_queue, self._api_started),
+                args=(self._qcf_config, self._logging_queue, self._finished_queue),
             )
             self._api_proc.start()
 
@@ -315,7 +324,6 @@ class FractalSnowflake:
             self._api_proc.terminate()
             self._api_proc.join()
             self._api_proc = None
-            self._api_started.clear()
             self._update_finalizer()
 
     def _start_compute(self):
@@ -384,9 +392,6 @@ class FractalSnowflake:
 
         If it does not come up after some time, an exception will be raised
         """
-
-        running = self._api_started.wait(10.0)
-        assert running
 
         # Seems there still may be a small time after the event is triggered and before
         # it can handle requests
@@ -523,6 +528,18 @@ class FractalSnowflake:
         c = PortalClient(self.get_uri())
         c._timeout = 2
         return c
+
+    def dump_database(self, filepath: str) -> None:
+        """
+        Dumps the database to a file
+
+        Parameters
+        ----------
+        filepath
+            Path to the output file to create
+        """
+
+        self._pg_harness.backup_database(filepath)
 
     def __enter__(self):
         return self

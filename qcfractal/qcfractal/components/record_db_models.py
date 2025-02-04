@@ -109,7 +109,6 @@ class OutputStoreORM(BaseORM):
         return decompress(self.data, self.compression_type)
 
 
-
 # Mark the storage of the data column as external
 event.listen(
     OutputStoreORM.__table__,
@@ -135,7 +134,7 @@ class NativeFileORM(BaseORM):
 
     __table_args__ = (UniqueConstraint("record_id", "name", name="ux_native_file_record_id_name"),)
 
-    _qcportal_model_excludes = ["id", "history_id", "compression_level"]
+    _qcportal_model_excludes = ["id", "record_id", "compression_level"]
 
     def get_file(self) -> Any:
         return decompress(self.data, self.compression_type)
@@ -198,7 +197,7 @@ class BaseRecordORM(BaseORM):
     id = Column(Integer, primary_key=True)
 
     # Extra fields
-    extras = Column(JSONB)
+    extras = Column(JSONB, nullable=False, default=dict)
 
     # Compute status
     # (Denormalized from compute history table for faster lookup during manager claiming/returning)
@@ -272,7 +271,7 @@ class BaseRecordORM(BaseORM):
         Index("ix_base_record_manager_name", "manager_name"),
         Index("ix_base_record_owner_user_id", "owner_user_id"),
         Index("ix_base_record_owner_group_id", "owner_group_id"),
-        Index("ix_base_record_created_on", "created_on", postgresql_using="brin"),
+        Index("ix_base_record_created_on", "created_on"),
         Index("ix_base_record_modified_on", "modified_on"),
         ForeignKeyConstraint(
             ["owner_user_id", "owner_group_id"],

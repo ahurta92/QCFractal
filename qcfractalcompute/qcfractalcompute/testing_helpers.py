@@ -4,7 +4,7 @@ import os
 import tempfile
 import threading
 import weakref
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 
 import parsl
 
@@ -17,12 +17,28 @@ from qcfractalcompute.apps.models import AppTaskResult
 from qcfractalcompute.compress import compress_result
 from qcfractalcompute.compute_manager import ComputeManager
 from qcfractalcompute.config import FractalComputeConfig, FractalServerSettings, LocalExecutorConfig
-from qcportal.all_results import AllResultTypes
+from qcportal.all_results import AllResultTypes, FailedOperation
 from qcportal.record_models import PriorityEnum, RecordTask
+from qcportal.utils import update_nested_dict
+
+failed_op = FailedOperation(
+    input_data=None,
+    error={"error_type": "internal_error", "error_message": "This is a test error message"},
+)
+
+
+class MockTestingAppManager:
+    def all_program_info(self, executor_label: Optional[str] = None) -> Dict[str, List[str]]:
+        return _activated_manager_programs
 
 
 class MockTestingComputeManager(ComputeManager):
-    def __init__(self, qcf_config: FractalConfig, result_data: Dict[int, AllResultTypes]):
+    def __init__(
+        self,
+        qcf_config: FractalConfig,
+        result_data: Optional[Dict[int, AllResultTypes]] = None,
+        additional_manager_config: Optional[Dict[str, Any]] = None,
+    ):
         self._qcf_config = qcf_config
 
         host = self._qcf_config.api.host
@@ -38,11 +54,12 @@ class MockTestingComputeManager(ComputeManager):
         os.makedirs(parsl_run_dir, exist_ok=True)
         os.makedirs(compute_scratch_dir, exist_ok=True)
 
-        self._compute_config = FractalComputeConfig(
+        config_dict = dict(
             base_folder=tmpdir.name,
             parsl_run_dir=parsl_run_dir,
             cluster="mock_compute",
             update_frequency=1,
+            update_frequency_jitter=0.0,
             server=FractalServerSettings(
                 fractal_uri=uri,
                 verify=False,
@@ -57,10 +74,15 @@ class MockTestingComputeManager(ComputeManager):
                 )
             },
         )
-        ComputeManager.__init__(self, self._compute_config)
 
-        # overwrite the executor programs for testing
-        self.executor_programs = {"local": _activated_manager_programs}
+        if additional_manager_config:
+            config_dict = update_nested_dict(config_dict, additional_manager_config)
+
+        self._compute_config = FractalComputeConfig(**config_dict)
+
+        # Set the app manager already
+        self.app_manager = MockTestingAppManager()
+        ComputeManager.__init__(self, self._compute_config)
 
         def cleanup(d):
             d.cleanup()
@@ -76,15 +98,26 @@ class MockTestingComputeManager(ComputeManager):
     def _submit_tasks(self, executor_label: str, tasks: List[RecordTask]):
         # A mock app that just returns the result data given to it after two seconds
         @parsl.python_app(data_flow_kernel=self.dflow_kernel)
-        def _mock_app(result: AllResultTypes) -> AppTaskResult:
+        def _mock_app(result: Optional[AllResultTypes]) -> AppTaskResult:
             import time
 
             time.sleep(2)
-            return AppTaskResult(success=result.success, walltime=2.0, result_compressed=compress_result(result.dict()))
+
+            if result is None:
+                return AppTaskResult(success=False, walltime=2.0, result_compressed=compress_result(failed_op.dict()))
+            else:
+                return AppTaskResult(
+                    success=result.success, walltime=2.0, result_compressed=compress_result(result.dict())
+                )
 
         for task in tasks:
             self._record_id_map[task.id] = task.record_id
-            task_future = _mock_app(self._result_data[task.record_id])
+
+            if self._result_data:
+                task_future = _mock_app(self._result_data.get(task.record_id, None))
+            else:
+                task_future = _mock_app(None)
+
             self._task_futures[executor_label][task.id] = task_future
 
 
@@ -93,9 +126,16 @@ class QCATestingComputeThread:
     Runs a compute manager in a separate process
     """
 
-    def __init__(self, qcf_config: FractalConfig, result_data: Dict[int, AllResultTypes] = None):
+    def __init__(
+        self,
+        qcf_config: FractalConfig,
+        result_data: Dict[int, AllResultTypes] = None,
+        additional_manager_config: Optional[Dict[str, Any]] = None,
+    ):
         self._qcf_config = qcf_config
         self._result_data = result_data
+
+        self._additional_manager_config = additional_manager_config
 
         self._compute: Optional[MockTestingComputeManager] = None
         self._compute_thread = None
@@ -112,7 +152,7 @@ class QCATestingComputeThread:
     def start(self, manual_updates) -> None:
         if self._compute is not None:
             raise RuntimeError("Compute manager already started")
-        self._compute = MockTestingComputeManager(self._qcf_config, self._result_data)
+        self._compute = MockTestingComputeManager(self._qcf_config, self._result_data, self._additional_manager_config)
         self._compute_thread = threading.Thread(
             target=self._compute.start, kwargs={"manual_updates": manual_updates}, daemon=True
         )
@@ -133,6 +173,8 @@ class QCATestingComputeThread:
         self._compute_thread = None
 
     def is_alive(self) -> bool:
+        if self._compute_thread is None:
+            return False
         return self._compute_thread.is_alive()
 
 

@@ -7,6 +7,7 @@ from __future__ import annotations
 import logging
 import os
 import secrets
+import tempfile
 from typing import Optional, Dict, Union, Any
 
 import yaml
@@ -21,15 +22,7 @@ except ImportError:
 from sqlalchemy.engine.url import URL, make_url
 
 from qcfractal.port_util import find_open_port
-
-
-def update_nested_dict(d, u):
-    for k, v in u.items():
-        if isinstance(v, dict):
-            d[k] = update_nested_dict(d.get(k, {}), v)
-        else:
-            d[k] = v
-    return d
+from qcportal.utils import duration_to_seconds, update_nested_dict
 
 
 def _make_abs_path(path: Optional[str], base_folder: str, default_filename: Optional[str]) -> Optional[str]:
@@ -137,8 +130,8 @@ class DatabaseConfig(ConfigBase):
         description="The port the database is running on. If own = True, a database will be started, binding to this port",
     )
     database_name: str = Field("qcfractal_default", description="The database name to connect to.")
-    username: Optional[str] = Field(None, description="The database username to connect with")
-    password: Optional[str] = Field(None, description="The database password to connect with")
+    username: str = Field(..., description="The database username to connect with")
+    password: str = Field(..., description="The database password to connect with")
     query: Dict[str, str] = Field({}, description="Extra connection query parameters at the end of the URL string")
 
     own: bool = Field(
@@ -277,7 +270,6 @@ class APILimitConfig(ConfigBase):
     manager_tasks_claim: int = Field(200, description="Number of tasks a single manager can pull down")
     manager_tasks_return: int = Field(10, description="Number of tasks a single manager can return at once")
 
-    get_server_stats: int = Field(25, description="Number of server statistics records to return")
     get_access_logs: int = Field(1000, description="Number of access log records to return")
     get_error_logs: int = Field(100, description="Number of error log records to return")
     get_internal_jobs: int = Field(1000, description="Number of internal jobs to return")
@@ -291,14 +283,13 @@ class WebAPIConfig(ConfigBase):
     Settings for the Web API (api) interface
     """
 
-    num_workers: int = Field(1, description="Number of worker processes to spawn in Gunicorn")
-    num_threads_per_worker: int = Field(1, description="Number of threads per worker")
+    num_threads_per_worker: int = Field(4, description="Number of threads per worker")
     worker_timeout: int = Field(
         120,
         description="If the master process does not hear from a worker for the given amount of time (in seconds),"
         "kill it. This effectively limits the time a worker has to respond to a request",
     )
-    host: str = Field("127.0.0.1", description="The IP address or hostname to bind to")
+    host: str = Field("localhost", description="The IP address or hostname to bind to")
     port: int = Field(7777, description="The port on which to run the REST interface.")
 
     secret_key: str = Field(..., description="Secret key for flask api. See documentation")
@@ -313,12 +304,47 @@ class WebAPIConfig(ConfigBase):
     extra_flask_options: Optional[Dict[str, Any]] = Field(
         None, description="Any additional options to pass directly to flask"
     )
-    extra_gunicorn_options: Optional[Dict[str, Any]] = Field(
-        None, description="Any additional options to pass directly to gunicorn"
+    extra_waitress_options: Optional[Dict[str, Any]] = Field(
+        None, description="Any additional options to pass directly to the waitress serve function"
     )
+
+    @validator("jwt_access_token_expires", "jwt_refresh_token_expires", pre=True)
+    def _convert_durations(cls, v):
+        return duration_to_seconds(v)
 
     class Config(ConfigCommon):
         env_prefix = "QCF_API_"
+
+
+class S3BucketMap(ConfigBase):
+    dataset_attachment: str = Field("dataset_attachment", description="Bucket to hold dataset views")
+
+
+class S3Config(ConfigBase):
+    """
+    Settings for using external files with S3
+    """
+
+    enabled: bool = False
+    verify: bool = True
+    passthrough: bool = False
+    endpoint_url: Optional[str] = Field(None, description="S3 endpoint URL")
+    access_key_id: Optional[str] = Field(None, description="AWS/S3 access key")
+    secret_access_key: Optional[str] = Field(None, description="AWS/S3 secret key")
+
+    bucket_map: S3BucketMap = Field(S3BucketMap(), description="Configuration for where to store various files")
+
+    class Config(ConfigCommon):
+        env_prefix = "QCF_S3_"
+
+    @root_validator()
+    def _check_enabled(cls, values):
+        if values.get("enabled", False) is True:
+            for key in ["endpoint_url", "access_key_id", "secret_access_key"]:
+                if values.get(key, None) is None:
+                    raise ValueError(f"S3 enabled but {key} not set")
+
+        return values
 
 
 class FractalConfig(ConfigBase):
@@ -331,6 +357,11 @@ class FractalConfig(ConfigBase):
         description="The base directory to use as the default for some options (logs, etc). Default is the location of the config file.",
     )
 
+    temporary_dir: Optional[str] = Field(
+        None,
+        description="Temporary directory to use for things such as view creation. If None, uses system default. This may require a lot of space!",
+    )
+
     # Info for the REST interface
     name: str = Field("QCFractal Server", description="The QCFractal server name")
 
@@ -338,6 +369,12 @@ class FractalConfig(ConfigBase):
     allow_unauthenticated_read: bool = Field(
         True,
         description="Allows unauthenticated read access to this instance. This does not extend to sensitive tables (such as user information)",
+    )
+    strict_queue_tags: bool = Field(
+        False,
+        description="If True, disables wildcard behavior for queue tags. This disables managers from claiming all "
+        "tags if they specify a wildcard ('*') tag. Managers will still be able to claim tasks with an "
+        "explicit '*' tag if they specifiy the '*' queue tag in their config",
     )
 
     # Logging and profiling
@@ -358,21 +395,27 @@ class FractalConfig(ConfigBase):
     )
 
     # Periodics
-    statistics_frequency: int = Field(
-        3600, description="The frequency at which to update servre statistics (in seconds)"
-    )
     service_frequency: int = Field(60, description="The frequency at which to update services (in seconds)")
     max_active_services: int = Field(20, description="The maximum number of concurrent active services")
     heartbeat_frequency: int = Field(
-        1800, description="The frequency (in seconds) to check the heartbeat of compute managers"
+        1800,
+        description="The frequency (in seconds) to check the heartbeat of compute managers",
+        gt=0,
+    )
+    heartbeat_frequency_jitter: int = Field(
+        0.1, description="Jitter fraction to be applied to the heartbeat frequency", ge=0
     )
     heartbeat_max_missed: int = Field(
         5,
         description="The maximum number of heartbeats that a compute manager can miss. If more are missed, the worker is considered dead",
+        ge=0,
     )
 
     # Access logging
     log_access: bool = Field(False, description="Store API access in the database")
+    access_log_keep: int = Field(
+        0, description="How far back to keep access logs (in days or as a duration string). 0 means keep all"
+    )
 
     # maxmind_account_id: Optional[int] = Field(None, description="Account ID for MaxMind GeoIP2 service")
     maxmind_license_key: Optional[str] = Field(
@@ -393,6 +436,9 @@ class FractalConfig(ConfigBase):
     internal_job_processes: int = Field(
         1, description="Number of processes for processing internal jobs and async requests"
     )
+    internal_job_keep: int = Field(
+        0, description="How far back to keep finished internal jobs (in days or as a duration string). 0 means keep all"
+    )
 
     # Homepage settings
     homepage_redirect_url: Optional[str] = Field(None, description="Redirect to this URL when going to the root path")
@@ -401,11 +447,14 @@ class FractalConfig(ConfigBase):
     # Other settings blocks
     database: DatabaseConfig = Field(..., description="Configuration of the settings for the database")
     api: WebAPIConfig = Field(..., description="Configuration of the REST interface")
+    s3: S3Config = Field(S3Config(), description="Configuration of the S3 file storage (optional)")
     api_limits: APILimitConfig = Field(..., description="Configuration of the limits to the api")
     auto_reset: AutoResetConfig = Field(..., description="Configuration for automatic resetting of tasks")
 
     @root_validator(pre=True)
     def _root_validator(cls, values):
+        logger = logging.getLogger("config_validation")
+
         values.setdefault("database", dict())
         if "base_folder" not in values["database"]:
             values["database"]["base_folder"] = values.get("base_folder")
@@ -413,6 +462,19 @@ class FractalConfig(ConfigBase):
         values.setdefault("api_limits", dict())
         values.setdefault("api", dict())
         values.setdefault("auto_reset", dict())
+
+        if "statistics_frequency" in values:
+            values.pop("statistics_frequency")
+            logger.warning("The 'statistics_frequency' setting is no longer used and is now ignored")
+
+        if "num_workers" in values["api"]:
+            values["api"].pop("num_workers")
+            logger.warning("The 'num_workers' setting is no longer used and is now ignored")
+
+        if "get_server_stats" in values["api_limits"]:
+            values["api_limits"].pop("get_server_stats")
+            logger.warning("The 'get_server_stats' setting in 'api_limits' is no longer used and is now ignored")
+
         return values
 
     @validator("geoip2_dir")
@@ -432,6 +494,25 @@ class FractalConfig(ConfigBase):
         v = v.upper()
         if v not in ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]:
             raise ValidationError(f"{v} is not a valid loglevel. Must be DEBUG, INFO, WARNING, ERROR, or CRITICAL")
+        return v
+
+    @validator("service_frequency", "heartbeat_frequency", pre=True)
+    def _convert_durations(cls, v):
+        return duration_to_seconds(v)
+
+    @validator("access_log_keep", "internal_job_keep", pre=True)
+    def _convert_durations_days(cls, v):
+        if isinstance(v, int) or (isinstance(v, str) and v.isdigit()):
+            return int(v) * 86400
+        return duration_to_seconds(v)
+
+    @validator("temporary_dir", pre=True)
+    def _create_temporary_directory(cls, v, values):
+        v = _make_abs_path(v, values["base_folder"], tempfile.gettempdir())
+
+        if v is not None and not os.path.exists(v):
+            os.makedirs(v)
+
         return v
 
     class Config(ConfigCommon):
@@ -541,12 +622,17 @@ def write_initial_configuration(file_path: str, full_config: bool = True):
     secret_key = secrets.token_urlsafe(32)
     jwt_secret_key = secrets.token_urlsafe(32)
 
+    db_config = {
+        "username": "qcfractal",
+        "password": secrets.token_urlsafe(32),
+    }
+
     default_config = FractalConfig(
-        base_folder=base_folder, api={"secret_key": secret_key, "jwt_secret_key": jwt_secret_key}
+        base_folder=base_folder, api={"secret_key": secret_key, "jwt_secret_key": jwt_secret_key}, database=db_config
     )
 
-    default_config.database.port = find_open_port(5432)
-    default_config.api.port = find_open_port(7777)
+    default_config.database.port = find_open_port(starting_port=5432)
+    default_config.api.port = find_open_port(starting_port=7777)
 
     include = None
     if not full_config:
@@ -558,10 +644,9 @@ def write_initial_configuration(file_path: str, full_config: bool = True):
             "logfile": True,
             "loglevel": True,
             "service_frequency": True,
-            "statistics_frequency": True,
             "max_active_services": True,
             "heartbeat_frequency": True,
-            "database": {"own", "host", "port", "database_name", "base_folder"},
+            "database": {"own", "host", "port", "database_name", "base_folder", "username", "password"},
             "api": {"secret_key", "jwt_secret_key", "host", "port"},
         }
 

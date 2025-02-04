@@ -13,6 +13,7 @@ import shutil
 import signal
 import sys
 import textwrap
+import threading
 import time
 import traceback
 from typing import TYPE_CHECKING
@@ -24,12 +25,11 @@ from qcfractal import __version__
 from qcportal.auth import RoleInfo, UserInfo
 from .config import read_configuration, write_initial_configuration, FractalConfig, WebAPIConfig
 from .db_socket.socket import SQLAlchemySocket
-from .flask_app.gunicorn_app import FractalGunicornApp
+from .flask_app.waitress_app import FractalWaitressApp
 from .job_runner import FractalJobRunner
 from .postgres_harness import PostgresHarness
 
 if TYPE_CHECKING:
-    from typing import Tuple
     from logging import Logger
 
 
@@ -72,7 +72,7 @@ def dump_config(qcf_config: FractalConfig, indent: int = 0) -> str:
     return s
 
 
-def start_database(config: FractalConfig) -> Tuple[PostgresHarness, SQLAlchemySocket]:
+def start_database(config: FractalConfig, check_revision: bool) -> PostgresHarness:
     """
     Obtain a storage socket to a running postgres server
 
@@ -99,11 +99,11 @@ def start_database(config: FractalConfig) -> Tuple[PostgresHarness, SQLAlchemySo
     if not pg_harness.can_connect():
         raise RuntimeError(f"Database at {config.database.safe_uri} does not exist?")
 
-    # Start up a socket. The main thing is to see if it can connect, and also
-    # to check if the database needs to be upgraded
-    # We then no longer need the socket (gunicorn and job runner will use their own
-    # in their subprocesses)
-    return pg_harness, SQLAlchemySocket(config)
+    # Check that the database is up to date
+    if check_revision:
+        SQLAlchemySocket.check_db_revision(config.database)
+
+    return pg_harness
 
 
 def parse_args() -> argparse.Namespace:
@@ -119,19 +119,19 @@ def parse_args() -> argparse.Namespace:
 
     # Common help strings
     config_file_help = "Path to a QCFractal configuration file"
-    verbose_help = "Output more details about the startup of qcfractal-server commands"
+    verbose_help = "Output more details about the startup of qcfractal-server commands. Use twice for debug output"
 
     parser = argparse.ArgumentParser(description="A CLI for managing & running a QCFractal server.")
 
     parser.add_argument("--version", action="version", version=f"{__version__}")
-    parser.add_argument("--verbose", action="store_true", help=verbose_help)
+    parser.add_argument("-v", "--verbose", action="count", default=0, help=verbose_help)
 
     parser.add_argument("--config", help=config_file_help)
 
     # Common arguments. These are added to the subcommands
     # They are similar to the global options above, but with SUPPRESS as the default
     base_parser = argparse.ArgumentParser(add_help=False)
-    base_parser.add_argument("--verbose", action="store_true", default=argparse.SUPPRESS, help=verbose_help)
+    base_parser.add_argument("-v", "--verbose", action="count", default=argparse.SUPPRESS, help=verbose_help)
     base_parser.add_argument("--config", default=argparse.SUPPRESS, help=config_file_help)
 
     # Now start the real subcommands
@@ -165,7 +165,6 @@ def parse_args() -> argparse.Namespace:
     # Allow some config settings to be altered via the command line
     start.add_argument("--port", **WebAPIConfig.help_info("port"))
     start.add_argument("--host", **WebAPIConfig.help_info("host"))
-    start.add_argument("--num-workers", **WebAPIConfig.help_info("num_workers"))
     start.add_argument("--logfile", **FractalConfig.help_info("logfile"))
     start.add_argument("--loglevel", **FractalConfig.help_info("loglevel"))
     start.add_argument("--enable-security", **FractalConfig.help_info("enable_security"))
@@ -412,14 +411,31 @@ def server_start(config):
     logger = logging.getLogger(__name__)
 
     # Ensure that the database is alive, optionally starting it
-    start_database(config)
+    start_database(config, check_revision=True)
 
-    # Start up the gunicorn and job runner
-    gunicorn_app = FractalGunicornApp(config)
-    gunicorn_proc = multiprocessing.Process(target=gunicorn_app.run)
-    gunicorn_proc.start()
+    # Set up a queue for logging. All child process will send logs
+    # to this queue, and a separate thread will handle them
+    logging_queue = multiprocessing.Queue()
 
-    job_runners = [FractalJobRunner(config) for _ in range(config.internal_job_processes)]
+    def _log_thread(queue):
+        while True:
+            record = queue.get()
+
+            if record is None:
+                # None is used as a sentinel to stop the thread
+                break
+
+            logging.getLogger(record.name).handle(record)
+
+    log_thread = threading.Thread(target=_log_thread, args=(logging_queue,))
+    log_thread.start()
+
+    # Start up the api and job runner
+    api_app = FractalWaitressApp(config, logging_queue=logging_queue)
+    api_proc = multiprocessing.Process(target=api_app.run)
+    api_proc.start()
+
+    job_runners = [FractalJobRunner(config, logging_queue=logging_queue) for _ in range(config.internal_job_processes)]
     job_runner_procs = [multiprocessing.Process(target=jr.start) for jr in job_runners]
     for p in job_runner_procs:
         p.start()
@@ -436,8 +452,8 @@ def server_start(config):
     try:
         while True:
             time.sleep(15)
-            if not gunicorn_proc.is_alive():
-                raise RuntimeError("Gunicorn process died! Check the logs")
+            if not api_proc.is_alive():
+                raise RuntimeError("API process died! Check the logs")
             if not all([p.is_alive() for p in job_runner_procs]):
                 raise RuntimeError("A Job runner died! Check the logs")
 
@@ -466,13 +482,17 @@ def server_start(config):
         logger.critical(f"Exception while running QCFractal server:\n{tb}")
         exitcode = 1
 
-    # Gunicorn has its own sigal handling
-    gunicorn_proc.terminate()
-    gunicorn_proc.join()
+    api_proc.terminate()
+    api_proc.join()
 
     for p in job_runner_procs:
         p.terminate()
         p.join()
+
+    # Stop the logging thread
+    logger.debug("Stopping logging thread")
+    logging_queue.put(None)
+    log_thread.join()
 
     sys.exit(exitcode)
 
@@ -490,7 +510,7 @@ def server_start_job_runner(config):
 
     # Ensure that the database is alive. This also handles checking stuff,
     # even if we don't own the db (which we shouldn't)
-    start_database(config)
+    start_database(config, check_revision=True)
 
     # Now just run the job runner directly
     job_runner = FractalJobRunner(config)
@@ -507,7 +527,7 @@ def server_start_job_runner(config):
 
 
 def server_start_api(config):
-    from qcfractal.flask_app.gunicorn_app import FractalGunicornApp
+    from qcfractal.flask_app.waitress_app import FractalWaitressApp
 
     logger = logging.getLogger(__name__)
     logger.info("*** Starting a QCFractal API server ***")
@@ -519,14 +539,20 @@ def server_start_api(config):
 
     # Ensure that the database is alive. This also handles checking stuff,
     # even if we don't own the db (which we shouldn't)
-    start_database(config)
+    start_database(config, check_revision=True)
 
-    # Now just run the gunicorn process
-    api = FractalGunicornApp(config)
+    # Now just run the api process
+    api = FractalWaitressApp(config)
     api.run()
 
 
 def server_upgrade_db(config):
+
+    # Always set logging level to INFO, otherwise things are a bit quiet
+    root_logger = logging.getLogger()
+    if root_logger.level > logging.INFO:
+        root_logger.setLevel(logging.INFO)
+
     logger = logging.getLogger(__name__)
 
     # Don't use start_database - we don't want to create the socket (which
@@ -609,7 +635,10 @@ def server_upgrade_config(config_path):
 
 def server_user(args: argparse.Namespace, config: FractalConfig):
     user_command = args.user_command
-    pg_harness, storage = start_database(config)
+
+    # Don't check revision here - it will be done in the SQLAlchemySocket constructor
+    start_database(config, check_revision=False)
+    storage = SQLAlchemySocket(config)
 
     def print_user_info(u: UserInfo):
         enabled = "True" if u.enabled else "False"
@@ -716,7 +745,10 @@ def server_user(args: argparse.Namespace, config: FractalConfig):
 
 def server_role(args: argparse.Namespace, config: FractalConfig):
     role_command = args.role_command
-    pg_harness, storage = start_database(config)
+
+    # Don't check revision here - it will be done in the SQLAlchemySocket constructor
+    start_database(config, check_revision=False)
+    storage = SQLAlchemySocket(config)
 
     def print_role_info(r: RoleInfo):
         print("-" * 80)
@@ -746,7 +778,7 @@ def server_role(args: argparse.Namespace, config: FractalConfig):
 
 
 def server_backup(args: argparse.Namespace, config: FractalConfig):
-    pg_harness, _ = start_database(config)
+    pg_harness = start_database(config, check_revision=True)
 
     db_size = pg_harness.database_size()
     pretty_size = pretty_bytes(db_size)
@@ -856,16 +888,18 @@ def main():
     # Parse all the command line arguments
     args = parse_args()
 
-    # Set up a a log handler. This is used before the logfile is set up
+    # Set up a log handler. This is used before the logfile is set up
     log_handler = logging.StreamHandler(sys.stdout)
 
     # If the user wants verbose output (particularly about startup of all the commands), then set logging level
     # to be DEBUG
     # Use a stripped down format, since we are just logging to stdout
-    if args.verbose:
-        logging.basicConfig(level="DEBUG", handlers=[log_handler], format="%(levelname)s: %(name)s: %(message)s")
-    else:
-        logging.basicConfig(level="INFO", handlers=[log_handler], format="%(levelname)s: %(message)s")
+    if args.verbose == 0:
+        logging.basicConfig(level=logging.WARNING, handlers=[log_handler], format="%(levelname)s: %(message)s")
+    elif args.verbose == 1:
+        logging.basicConfig(level=logging.INFO, handlers=[log_handler], format="%(levelname)s: %(name)s: %(message)s")
+    elif args.verbose >= 2:
+        logging.basicConfig(level=logging.DEBUG, handlers=[log_handler], format="%(levelname)s: %(name)s: %(message)s")
 
     logger = logging.getLogger(__name__)
 
@@ -886,8 +920,6 @@ def main():
             cmd_config["api"]["port"] = args.port
         if args.host is not None:
             cmd_config["api"]["host"] = args.host
-        if args.num_workers is not None:
-            cmd_config["api"]["num_workers"] = args.num_workers
         if args.logfile is not None:
             cmd_config["logfile"] = args.logfile
         if args.loglevel is not None:

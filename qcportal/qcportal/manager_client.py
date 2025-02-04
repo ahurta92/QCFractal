@@ -43,7 +43,13 @@ class ManagerClient(PortalClientBase):
         """
 
         PortalClientBase.__init__(
-            self, address=address, username=username, password=password, verify=verify, show_motd=show_motd
+            self,
+            address=address,
+            username=username,
+            password=password,
+            verify=verify,
+            show_motd=show_motd,
+            information_endpoint="compute/v1/information",
         )
 
         self.manager_name_data = name_data
@@ -56,6 +62,7 @@ class ManagerClient(PortalClientBase):
             None,
             body=manager_update,
             allow_retries=False,
+            additional_headers={"Connection": "close"},
         )
 
     def activate(

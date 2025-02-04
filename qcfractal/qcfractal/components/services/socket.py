@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import logging
 import traceback
-from datetime import timedelta
 from typing import TYPE_CHECKING
 
-from sqlalchemy import select, or_
+from sqlalchemy import select, update, or_
 from sqlalchemy.dialects.postgresql import array_agg
-from sqlalchemy.orm import contains_eager, aliased, defer, selectinload, joinedload
+from sqlalchemy.orm import contains_eager, aliased, defer, selectinload, joinedload, load_only, lazyload
 
 from qcfractal.components.record_db_models import BaseRecordORM, RecordComputeHistoryORM
 from qcfractal.db_socket.helpers import (
@@ -23,8 +22,7 @@ from ..record_socket import BaseRecordSocket
 if TYPE_CHECKING:
     from sqlalchemy.orm.session import Session
     from qcfractal.db_socket.socket import SQLAlchemySocket
-    from qcfractal.components.internal_jobs.status import JobProgress
-    from typing import List, Dict, Tuple, Optional, Any, Union
+    from typing import List, Dict, Tuple, Optional, Any, Union, Sequence
 
 
 class ServiceSocket:
@@ -38,31 +36,15 @@ class ServiceSocket:
         self._max_active_services = root_socket.qcf_config.max_active_services
         self._service_frequency = root_socket.qcf_config.service_frequency
 
-        # Add the initial job for iterating the service
-        self.add_internal_job_iterate_services(0.0)
-
-    def add_internal_job_iterate_services(self, delay: float, *, session: Optional[Session] = None):
-        """
-        Adds an internal job to check/update the services
-
-        Parameters
-        ----------
-        delay
-            Schedule for this many seconds in the future
-        session
-            An existing SQLAlchemy session to use. If None, one will be created. If an existing session
-            is used, it will be flushed (but not committed) before returning from this function.
-        """
-        with self.root_socket.optional_session(session) as session:
+        with self.root_socket.session_scope() as session:
             self.root_socket.internal_jobs.add(
                 "iterate_services",
-                now_at_utc() + timedelta(seconds=delay),
+                now_at_utc(),
                 "services.iterate_services",
                 {},
                 user_id=None,
                 unique_name=True,
-                after_function="services.add_internal_job_iterate_services",
-                after_function_kwargs={"delay": self._service_frequency},
+                repeat_delay=self._service_frequency,
                 session=session,
             )
 
@@ -78,7 +60,7 @@ class ServiceSocket:
         session.commit()
         self.root_socket.notify_finished_watch(service_orm.record_id, RecordStatusEnum.complete)
 
-    def _iterate_service(self, session: Session, job_progress: JobProgress, service_id: int) -> bool:
+    def _iterate_service(self, session: Session, service_id: int) -> bool:
         """
         Iterate a single service given its service id
 
@@ -86,8 +68,6 @@ class ServiceSocket:
         -----------
         session
             An existing SQLAlchemy session to use. This session will be committed at the end of this function
-        job_progress
-            An object used to report the current job progress and status
         service_id
             ID of the service to iterate (not the record ID)
 
@@ -151,7 +131,7 @@ class ServiceSocket:
             session.commit()
             return False
 
-    def iterate_services(self, session: Session, job_progress: JobProgress) -> int:
+    def iterate_services(self, session: Session) -> int:
         """
         Check for services that have their dependencies finished, and then either queue them for iteration
         or mark them as errored
@@ -166,8 +146,6 @@ class ServiceSocket:
         ----------
         session
             An existing SQLAlchemy session to use. This session will be periodically committed
-        job_progress
-            An object used to report the current job progress and status
 
         Returns
         -------
@@ -320,7 +298,7 @@ class ServiceSocket:
                     hist.modified_on = now
 
                     stdout_str = f"Starting service: {service_orm.record.record_type} at {now}"
-                    stdout = self.root_socket.records.create_output_orm(session, OutputTypeEnum.stdout, stdout_str)
+                    stdout = self.root_socket.records.create_output_orm(OutputTypeEnum.stdout, stdout_str)
                     hist.outputs[OutputTypeEnum.stdout] = stdout
 
                     service_orm.record.compute_history.append(hist)
@@ -388,16 +366,38 @@ class ServiceSubtaskRecordSocket(BaseRecordSocket):
     def get_children_select() -> List[Any]:
         return []
 
-    def generate_task_specification(self, record_orm: ServiceSubtaskRecordORM) -> Dict[str, Any]:
+    def generate_task_specifications(self, session: Session, record_ids: Sequence[int]) -> List[Dict[str, Any]]:
+
         # Normally, this function is a little more complicated (ie, for others the spec is
         # generated from data in the record). However, this record type is a pretty
         # transparent passthrough. The function and kwargs stored in the record, so just return them
-        return {"function": record_orm.function, "function_kwargs": record_orm.function_kwargs}
 
-    def update_completed_task(
-        self, session: Session, record_orm: ServiceSubtaskRecordORM, result: GenericTaskResult, manager_name: str
-    ) -> None:
-        record_orm.results = result.results
+        stmt = select(ServiceSubtaskRecordORM).filter(ServiceSubtaskRecordORM.id.in_(record_ids))
+        stmt = stmt.options(
+            load_only(
+                ServiceSubtaskRecordORM.id, ServiceSubtaskRecordORM.function, ServiceSubtaskRecordORM.function_kwargs
+            )
+        )
+        stmt = stmt.options(lazyload("*"))
+
+        record_orms = session.execute(stmt).scalars().all()
+
+        task_specs = {
+            record_orm.id: {"function": record_orm.function, "function_kwargs": record_orm.function_kwargs}
+            for record_orm in record_orms
+        }
+
+        if set(record_ids) != set(task_specs.keys()):
+            raise RuntimeError("Did not generate all task specs for all service subtask records?")
+
+        # Return in the input order
+        return [task_specs[rid] for rid in record_ids]
+
+    def update_completed_task(self, session: Session, record_id: int, result: GenericTaskResult) -> None:
+
+        record_updates = {"results": result.results}
+        stmt = update(ServiceSubtaskRecordORM).where(ServiceSubtaskRecordORM.id == record_id).values(record_updates)
+        session.execute(stmt)
 
     def add(
         self,

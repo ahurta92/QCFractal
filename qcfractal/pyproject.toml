@@ -23,23 +23,29 @@ classifiers = [
 dependencies = [
     "flask",
     "flask-jwt-extended",
-    "gunicorn",
+    "waitress",
     "bcrypt",
     "sqlalchemy >=2.0",
     "alembic",
     "psycopg2",
+    "qcportal",
 ]
 
 
 [project.optional-dependencies]
 services = [
     "torsiondrive",
+    "qcmanybody",
+    "geometric",
 ]
 geoip = [
     "geoip2"
 ]
 snowflake = [
     "qcfractalcompute"
+]
+s3 = [
+    "boto3"
 ]
 
 

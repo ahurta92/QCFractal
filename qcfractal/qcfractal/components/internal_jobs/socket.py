@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import logging
 import select as io_select
 import traceback
@@ -12,14 +13,16 @@ from typing import TYPE_CHECKING
 import psycopg2.extensions
 from sqlalchemy import select, delete, update, and_, or_
 from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.exc import IntegrityError
 
 from qcfractal.components.auth.db_models import UserIDMapSubquery
 from qcfractal.db_socket.helpers import get_query_proj_options
 from qcportal.exceptions import MissingDataError
 from qcportal.internal_jobs.models import InternalJobStatusEnum, InternalJobQueryFilters
+from qcportal.serialization import encode_to_json
 from qcportal.utils import now_at_utc
 from .db_models import InternalJobORM
-from .status import JobProgress
+from .status import JobProgress, CancelledJobException, JobRunnerStoppingException
 
 if TYPE_CHECKING:
     from qcfractal.db_socket.socket import SQLAlchemySocket
@@ -42,6 +45,23 @@ class InternalJobSocket:
         # Hardcoded for now
         self._update_frequency = 5
 
+        # Old internal job cleanup
+        self._delete_internal_job_frequency = 60 * 60 * 24  # one day
+        self._internal_job_keep = root_socket.qcf_config.internal_job_keep
+
+        if self._internal_job_keep > 0:
+            with self.root_socket.session_scope() as session:
+                self.add(
+                    "delete_old_internal_jobs",
+                    now_at_utc() + timedelta(seconds=2.0),
+                    "internal_jobs.delete_old_internal_jobs",
+                    {},
+                    user_id=None,
+                    unique_name=True,
+                    repeat_delay=self._delete_internal_job_frequency,
+                    session=session,
+                )
+
     def add(
         self,
         name: str,
@@ -52,6 +72,8 @@ class InternalJobSocket:
         unique_name: bool = False,
         after_function: Optional[str] = None,
         after_function_kwargs: Optional[Dict[str, Any]] = None,
+        repeat_delay: Optional[int] = None,
+        serial_group: Optional[str] = None,
         *,
         session: Optional[Session] = None,
     ) -> int:
@@ -78,6 +100,10 @@ class InternalJobSocket:
             When this job is done, call this function
         after_function_kwargs
             Arguments to use when calling `after_function`
+        repeat_delay
+            If set, will submit a new, identical job to be run repeat_delay seconds after this one finishes
+        serial_group
+            Only one job within this group may be run at once. If None, there is no limit
         session
             An existing SQLAlchemy session to use. If None, one will be created. If an existing session
             is used, it will be flushed (but not committed) before returning from this function.
@@ -93,48 +119,47 @@ class InternalJobSocket:
                 stmt = insert(InternalJobORM)
                 stmt = stmt.values(
                     name=name,
+                    status=InternalJobStatusEnum.waiting,
                     unique_name=name,
                     scheduled_date=scheduled_date,
                     function=function,
                     kwargs=kwargs,
                     after_function=after_function,
                     after_function_kwargs=after_function_kwargs,
-                    status=InternalJobStatusEnum.waiting,
+                    repeat_delay=repeat_delay,
+                    serial_group=serial_group,
                     user_id=user_id,
                 )
-                stmt = stmt.on_conflict_do_nothing()
+                stmt = stmt.on_conflict_do_update(
+                    constraint="ux_internal_jobs_unique_name",
+                    set_={
+                        "after_function": after_function,
+                        "after_function_kwargs": after_function_kwargs,
+                        "repeat_delay": repeat_delay,
+                    },
+                )
                 stmt = stmt.returning(InternalJobORM.id)
                 job_id = session.execute(stmt).scalar_one_or_none()
 
-                if job_id is None:
+                if job_id is not None:
+                    self._logger.debug(f"Job with name {name} added or updated - id: {job_id}")
+                else:
                     # Nothing was returned, meaning nothing was inserted
-                    self._logger.debug(f"Job with name {name} already found. Not adding")
+                    self._logger.debug(f"Job with name {name} already found. Not adding?")
                     stmt = select(InternalJobORM.id).where(InternalJobORM.unique_name == name)
                     job_id = session.execute(stmt).scalar_one_or_none()
-
-                if job_id is None:
-                    # Should be very rare (time-of-check to time-of-use condition: was deleted
-                    # after checking for existence but before getting ID)
-                    self._logger.debug(f"Handling job {name} time-of-check to time-of-use condition")
-                    self.add(
-                        name=name,
-                        scheduled_date=scheduled_date,
-                        function=function,
-                        kwargs=kwargs,
-                        user_id=user_id,
-                        unique_name=unique_name,
-                        after_function=after_function,
-                        after_function_kwargs=after_function_kwargs,
-                        session=session,
-                    )
 
             else:
                 job_orm = InternalJobORM(
                     name=name,
+                    status=InternalJobStatusEnum.waiting,
                     scheduled_date=scheduled_date,
                     function=function,
                     kwargs=kwargs,
-                    status=InternalJobStatusEnum.waiting,
+                    after_function=after_function,
+                    after_function_kwargs=after_function_kwargs,
+                    repeat_delay=repeat_delay,
+                    serial_group=serial_group,
                     user_id=user_id,
                 )
                 if unique_name:
@@ -260,6 +285,28 @@ class InternalJobSocket:
         with self.root_socket.optional_session(session) as session:
             session.execute(stmt)
 
+    def delete_old_internal_jobs(self, session: Session) -> None:
+        """
+        Deletes old internal jobs (as defined by the configuration)
+        """
+
+        # we check when adding the job, but double check here
+        if self._internal_job_keep <= 0:
+            return
+
+        before = now_at_utc() - timedelta(seconds=self._internal_job_keep)
+
+        stmt = delete(InternalJobORM)
+        stmt = stmt.where(
+            InternalJobORM.status.in_(
+                (InternalJobStatusEnum.complete, InternalJobStatusEnum.error, InternalJobStatusEnum.cancelled)
+            )
+        )
+        stmt = stmt.where(InternalJobORM.ended_date < before)
+        r = session.execute(stmt)
+        num_deleted = r.rowcount
+        self._logger.info(f"Deleted {num_deleted} internal jobs before {before}")
+
     def cancel(self, job_id: int, *, session: Optional[Session] = None):
         """
         Cancels a job in the job queue
@@ -287,32 +334,76 @@ class InternalJobSocket:
         Runs a single job
         """
 
+        # For logging (ORM may end up detached or somthing)
+        job_id = job_orm.id
+
         try:
             func_attr = attrgetter(job_orm.function)
 
             # Function must be part of the sockets
             func = func_attr(self.root_socket)
-            result = func(**job_orm.kwargs, job_progress=job_progress, session=session)
 
-            # Mark complete, unless this was cancelled
-            if not job_progress.cancelled():
-                job_orm.status = InternalJobStatusEnum.complete
-                job_orm.progress = 100
+            # We need to determine the parameters of this function
+            func_params = inspect.signature(func).parameters
 
-        except Exception:
+            add_kwargs = {}
+
+            # If the function has a "job_progress" and/or "session" args, pass those in
+            if "job_progress" in func_params:
+                add_kwargs["job_progress"] = job_progress
+
+            if "session" in func_params:
+                add_kwargs["session"] = session
+
+            # Run the desired function
+            # Raises an exception if cancelled
+            result = func(**job_orm.kwargs, **add_kwargs)
+
+            job_orm.status = InternalJobStatusEnum.complete
+            job_orm.progress = 100
+            job_orm.progress_description = "Complete"
+            job_orm.result = encode_to_json(result)
+
+        # Job itself is being cancelled
+        except CancelledJobException:
             session.rollback()
-            result = traceback.format_exc()
-            logger.error(f"Job {job_orm.id} failed with exception:\n{result}")
+            logger.info(f"Job {job_id} was cancelled")
+            job_orm.status = InternalJobStatusEnum.cancelled
+            job_orm.result = None
 
+        # Runner is stopping down
+        except JobRunnerStoppingException:
+            session.rollback()
+            logger.info(f"Job {job_id} was running, but runner is stopping")
+
+            # Basically reset everything
+            job_orm.status = InternalJobStatusEnum.waiting
+            job_orm.progress = 0
+            job_orm.progress_description = None
+            job_orm.started_date = None
+            job_orm.last_updated = None
+            job_orm.result = None
+            job_orm.runner_uuid = None
+
+        # Function itself had an error
+        except:
+            session.rollback()
+            job_orm.result = traceback.format_exc()
+            logger.error(f"Job {job_id} failed with exception:\n{job_orm.result}")
             job_orm.status = InternalJobStatusEnum.error
 
-        if not job_progress.deleted():
-            job_orm.ended_date = now_at_utc()
-            job_orm.last_updated = job_orm.ended_date
-            job_orm.result = result
+        if job_progress.deleted:
+            # Row does not exist anymore
+            session.expunge(job_orm)
+        else:
+            # If status is waiting, that means the runner itself is stopping or something
+            if job_orm.status != InternalJobStatusEnum.waiting:
+                job_orm.ended_date = now_at_utc()
+                job_orm.last_updated = job_orm.ended_date
 
-            # Clear the unique name so we can add another one if needed
-            job_orm.unique_name = None
+                # Clear the unique name so we can add another one if needed
+                has_unique_name = job_orm.unique_name is not None
+                job_orm.unique_name = None
 
             # Flush but don't commit. This will prevent marking the task as finished
             # before the after_func has been run, but allow new ones to be added
@@ -321,18 +412,54 @@ class InternalJobSocket:
 
             # Run the function specified to be run after
             if job_orm.status == InternalJobStatusEnum.complete and job_orm.after_function is not None:
-                after_func_attr = attrgetter(job_orm.after_function)
-                after_func = after_func_attr(self.root_socket)
-                after_func(**job_orm.after_function_kwargs, session=session)
-            session.commit()
+                try:
+                    after_func_attr = attrgetter(job_orm.after_function)
+                    after_func = after_func_attr(self.root_socket)
 
-    def _wait_for_job(self, session: Session, logger, conn, end_event) -> Optional[InternalJobORM]:
+                    after_func_params = inspect.signature(after_func).parameters
+                    add_after_kwargs = {}
+                    if "session" in after_func_params:
+                        add_after_kwargs["session"] = session
+                    after_func(**job_orm.after_function_kwargs, **add_after_kwargs)
+                except Exception:
+                    # Don't rollback? not sure what to do here
+                    result = traceback.format_exc()
+                    logger.error(f"Job {job_orm.id} failed with exception:\n{result}")
+
+                    job_orm.status = InternalJobStatusEnum.error
+
+            if job_orm.status == InternalJobStatusEnum.complete and job_orm.repeat_delay is not None:
+                self.add(
+                    name=job_orm.name,
+                    scheduled_date=now_at_utc() + timedelta(seconds=job_orm.repeat_delay),
+                    function=job_orm.function,
+                    kwargs=job_orm.kwargs,
+                    user_id=job_orm.user_id,
+                    unique_name=has_unique_name,
+                    after_function=job_orm.after_function,
+                    after_function_kwargs=job_orm.after_function_kwargs,
+                    repeat_delay=job_orm.repeat_delay,
+                    session=session,
+                )
+
+        session.commit()
+
+    @staticmethod
+    def _wait_for_job(session: Session, logger, conn, end_event):
         """
         Blocks until a job is possibly available to run
         """
 
+        serial_cte = select(InternalJobORM.serial_group).distinct()
+        serial_cte = serial_cte.where(InternalJobORM.status == InternalJobStatusEnum.running)
+        serial_cte = serial_cte.where(InternalJobORM.serial_group.is_not(None))
+        serial_cte = serial_cte.cte()
+
         next_job_stmt = select(InternalJobORM.scheduled_date)
         next_job_stmt = next_job_stmt.where(InternalJobORM.status == InternalJobStatusEnum.waiting)
+        next_job_stmt = next_job_stmt.where(
+            or_(InternalJobORM.serial_group.is_(None), InternalJobORM.serial_group.not_in(select(serial_cte)))
+        )
         next_job_stmt = next_job_stmt.order_by(InternalJobORM.scheduled_date.asc())
 
         # Skip any that are being claimed for running right now
@@ -380,21 +507,24 @@ class InternalJobSocket:
 
                 # waits until a notification is received, up to 5 seconds
                 # https://docs.python.org/3/library/select.html#select.select
-                if io_select.select([conn], [], [], to_wait) != ([], [], []):
-                    # We got a notification
-                    logger.debug("received notification from check_internal_jobs")
-                    conn.poll()
+                try:
+                    if io_select.select([conn], [], [], to_wait) != ([], [], []):
+                        # We got a notification
+                        logger.debug("received notification from check_internal_jobs")
+                        conn.poll()
 
-                    # We don't actually care about the individual notifications
-                    conn.notifies.clear()
+                        # We don't actually care about the individual notifications
+                        conn.notifies.clear()
 
-                    # Go back to the outer loop
-                    break
-                else:
-                    # select timed out. Check for event (we should shut down)
-                    if end_event.is_set():
+                        # Go back to the outer loop
                         break
-                    total_waited += to_wait
+                    else:
+                        # select timed out. Check for event (we should shut down)
+                        if end_event.is_set():
+                            break
+                        total_waited += to_wait
+                except KeyboardInterrupt:
+                    break
 
             if end_event.is_set():
                 break
@@ -414,9 +544,6 @@ class InternalJobSocket:
             stop this loop
         """
 
-        # Clean up engine connections after a fork
-        self.root_socket.post_fork_cleanup()
-
         # give this loop a unique uuid
         runner_uuid = str(uuid.uuid4())
 
@@ -434,6 +561,11 @@ class InternalJobSocket:
         conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
 
         # Prepare a statement for finding jobs. Filters will be added in the loop
+        serial_cte = select(InternalJobORM.serial_group).distinct()
+        serial_cte = serial_cte.where(InternalJobORM.status == InternalJobStatusEnum.running)
+        serial_cte = serial_cte.where(InternalJobORM.serial_group.is_not(None))
+        serial_cte = serial_cte.cte()
+
         stmt = select(InternalJobORM)
         stmt = stmt.order_by(InternalJobORM.scheduled_date.asc()).limit(1)
         stmt = stmt.with_for_update(skip_locked=True)
@@ -446,10 +578,20 @@ class InternalJobSocket:
             logger.debug("checking for jobs")
 
             # Pick up anything waiting, or anything that hasn't been updated in a while (12 update periods)
+
             now = now_at_utc()
             dead = now - timedelta(seconds=(self._update_frequency * 12))
             logger.debug(f"checking for jobs before date {now}")
-            cond1 = and_(InternalJobORM.status == InternalJobStatusEnum.waiting, InternalJobORM.scheduled_date <= now)
+
+            # Job is waiting, schedule to be run now or in the past,
+            # Serial group does not have any running or is not set
+            cond1 = and_(
+                InternalJobORM.status == InternalJobStatusEnum.waiting,
+                InternalJobORM.scheduled_date <= now,
+                or_(InternalJobORM.serial_group.is_(None), InternalJobORM.serial_group.not_in(select(serial_cte))),
+            )
+
+            # Job is running but runner is determined to be dead. Serial group doesn't matter
             cond2 = and_(InternalJobORM.status == InternalJobStatusEnum.running, InternalJobORM.last_updated < dead)
 
             stmt_now = stmt.where(or_(cond1, cond2))
@@ -478,8 +620,21 @@ class InternalJobSocket:
             job_orm.runner_uuid = runner_uuid
             job_orm.status = InternalJobStatusEnum.running
 
-            # Releases the row-level lock (from the with_for_update() in the original query)
-            session_main.commit()
+            # For logging below - the object might be in an odd state after the exception, where accessing
+            # it results in further exceptions
+            serial_group = job_orm.serial_group
+
+            # Violation of the unique constraint may occur - two runners attempting to take
+            # different jobs of the same serial group at the same time
+            try:
+                # Releases the row-level lock (from the with_for_update() in the original query)
+                session_main.commit()
+            except IntegrityError:
+                logger.info(
+                    f"Attempting to run job from serial group '{serial_group}, but seems like another runner got to another job from the same group first"
+                )
+                session_main.rollback()
+                continue
 
             job_progress = JobProgress(job_orm.id, runner_uuid, session_status, self._update_frequency, end_event)
             self._run_single(session_main, job_orm, logger, job_progress=job_progress)
